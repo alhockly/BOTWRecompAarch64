@@ -502,7 +502,12 @@ static void create_image(NvnTexture *t, TexBackend *b) {
     VkFormat listed[2] = {vf, twin};
     VkImageFormatListCreateInfo fl = {.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO, .viewFormatCount = 2,
                                       .pViewFormats = listed};
-    bool fixed = rt_list && !depthfmt && (t->flags & 8) && (!twin || g_vk.api >= VK_API_VERSION_1_2);
+#ifdef __ANDROID__
+    bool api12 = g_vk.api >= VK_API_VERSION_1_2;
+#else
+    bool api12 = true;  // the desktop device pick requires Vulkan 1.3
+#endif
+    bool fixed = rt_list && !depthfmt && (t->flags & 8) && (!twin || api12);
     b->fixed_fmt = fixed;
     b->view_alt = fixed ? twin : VK_FORMAT_UNDEFINED;
     if (!depthfmt && (!fixed || twin))

@@ -129,6 +129,12 @@ static uint64_t gc_size;
 static void gcopy_retire(uint64_t done);
 static void ga_flush_dirty(void);
 static void ga_invalidate(const void *p, uint64_t len);
+#elif defined(__linux__)
+static bool gwin_mode;    // (imported heap larger than one storage buffer: draws get a window of it, gwin_prepare)
+static bool gcopy_linux;  // (no host import: bound global memory copied by the CPU, linux_gcopy_prepare)
+static VkSpan gc_span;    // (gsnap / linux_gcopy: this draw's copy, gc_size bytes)
+static uint64_t gc_size;
+static void linux_gcopy_retire(uint64_t done);
 #endif
 
 void vk_wait_seq(uint64_t seq) {
@@ -147,6 +153,8 @@ void vk_wait_seq(uint64_t seq) {
     else if (r == VK_SUCCESS) cq_resolve_done(seq);  // (the game reads its timing counters after waiting)
 #ifdef __ANDROID__
     if (r == VK_SUCCESS) gcopy_retire(seq);
+#elif defined(__linux__)
+    if (r == VK_SUCCESS) linux_gcopy_retire(seq);
 #endif
     else {
         extern void vk_devlost_dump(void);
@@ -200,6 +208,8 @@ static int64_t cq_offset;  // host ns - GPU ns (the smallest seen)
 // (x 625 / 384). Writing ns made every GPU time look 1.63x as long.
 static uint64_t ns_to_gpu_ticks(uint64_t ns) { return (uint64_t)((unsigned __int128)ns * 384 / 625); }
 static bool cq_calibrated;
+
+uint64_t renderer_present_count(void);
 
 #ifdef __ANDROID__
 // ---- LARECOMP_FRAME_TIMELINE=<frame>: four frames from that one, every step in time order - the game's lists, fences,
@@ -1005,6 +1015,8 @@ VkSpan vk_transient(uint64_t size, uint64_t align) {
     uint64_t done = vk_completed_seq();
 #ifdef __ANDROID__
     gcopy_retire(done);  // (copies back out of chunks about to be reused)
+#elif defined(__linux__)
+    linux_gcopy_retire(done);
 #endif
     // Chunks idle for 10 s go back to the driver: a burst of copies (hundreds of MB a frame after a load on a Mali, #89)
     // grew the ring for good, and the app's memory with it - 256 MB steps up to the crash in #131. The first free one
@@ -1437,6 +1449,22 @@ void vk_exec_init(void) {
     // (nor with an exported file to map there: vk_heap_place turns it on if that fails)
     extern bool vk_heap_file_asked(void);
     if (gcopy_mode && !g_vk.map_placed && !vk_heap_file_asked()) plat_write_tracking_enable(HEAP_BASE, HEAP_BASE + HEAP_MAX);
+#elif defined(__linux__)
+    // Turnip on Adreno 6xx often has no VK_EXT_external_memory_host, so the guest heap is not a storage buffer.
+    // A window then has nothing to point at and glyph loads (about 2.7 GB into the heap, past the 128 MB range)
+    // stay zero. Copy the bound ranges instead, as Android does when it cannot import the heap. When the import
+    // does exist and the heap is larger than one storage buffer, use the window.
+    gcopy_linux = !g_vk.host_import && !getenv("LARECOMP_VK_NO_GCOPY");
+    gwin_mode = !gcopy_linux && !getenv("LARECOMP_VK_NO_GWIN") &&
+                g_vk.props.limits.maxStorageBufferRange < HEAP_MAX;
+    // Placement happens at SetHeapSize (vk_heap_place). Until then, copies stay on. Tracking starts only if placement
+    // will not be tried, so a mapped heap is never made read-only.
+    if (gcopy_linux && !g_vk.map_placed) {
+        LOG("[vk] no heap import: shader global memory through CPU copies\n");
+        plat_write_tracking_enable(HEAP_BASE, HEAP_BASE + HEAP_MAX);
+    } else if (gwin_mode)
+        LOG("[vk] storage range %llu MB cannot cover the guest heap: shader global memory through windows\n",
+            (unsigned long long)(g_vk.props.limits.maxStorageBufferRange >> 20));
 #endif
     if (prof) {
         prof_up_ns = 0;
@@ -2611,6 +2639,8 @@ static void translate_program(void *arg) {
     maxwell_native_half = !getenv("LARECOMP_BITWISE_HALF");
     maxwell_fast_minmax = !getenv("LARECOMP_SAFE_MATH");
     maxwell_cb_window = cbwin_wanted();
+#elif defined(__linux__)
+    maxwell_gmem_map_all = gwin_mode || gcopy_linux;  // (global loads go through the window or the CPU copy, not gmem_ from offset 0)
 #endif
     p->vi = maxwell_translate_bounded((const uint8_t *)(uintptr_t)p->code[0], p->cmax[0], p->const_bytes[0], STAGE_VERTEX, &p->vkey);
     if (p->vi->msl) {
@@ -3515,12 +3545,17 @@ static void resolve_feedback(Prog *pr, uint32_t draw_written) {
                 // frame by frame on the Adreno 830 - Automatic keeps it to the Adreno 8xx (settings.h inplace_reads,
                 // the start screen's Driver compatibility; LARECOMP_FEEDBACK_INPLACE=1 on any driver).
                 if (g_inplace_copy < 0) {
+#ifdef __ANDROID__
                     extern bool vk_driver_is_turnip(void);
                     extern bool vk_turnip_path_on(int setting);
                     bool inplace = getenv("LARECOMP_FEEDBACK_INPLACE") || (vk_driver_is_turnip() && vk_turnip_path_on(g_settings.inplace_reads));
+                    const char *how = g_settings.inplace_reads < 0 ? "automatic" : "settings";
+#else
+                    bool inplace = getenv("LARECOMP_FEEDBACK_INPLACE") != NULL;
+                    const char *how = "off";
+#endif
                     g_inplace_copy = getenv("LARECOMP_FEEDBACK_COPY") != NULL || !inplace;
-                    LOG("[vk] targets a draw writes, sampled by it: %s (%s)\n", g_inplace_copy ? "copies" : "in place",
-                        g_settings.inplace_reads < 0 ? "automatic" : "settings");
+                    LOG("[vk] targets a draw writes, sampled by it: %s (%s)\n", g_inplace_copy ? "copies" : "in place", how);
                 }
                 extern int vk_ab(const char *what);
                 if (!g_inplace_copy && bit && bit < 1u << 8 && AB("copy") != 1) {
@@ -4189,6 +4224,93 @@ static bool gmem_import(uint64_t size) {
 
 static uint64_t gmem_tried;  // heap size the import was last attempted for (gmem_info imports / re-imports)
 
+#ifdef __linux__
+// Turnip only: map the guest heap at HEAP_BASE with VK_EXT_map_memory_placed. No memfd and no settings. On success the
+// draw path binds this buffer (guest_direct) and glyph loads use the storage window. On failure the CPU copies stay.
+bool vk_heap_place(uint64_t size) {
+    extern bool vk_driver_is_turnip(void);
+    if (!size || !g_vk.map_placed || !vk_driver_is_turnip() || getenv("LARECOMP_VK_NO_PLACED")) {
+        if (gcopy_linux) plat_write_tracking_enable(HEAP_BASE, HEAP_BASE + HEAP_MAX);
+        return false;
+    }
+    vk_wait_ready();
+    if (gmem_buf) return true;
+    FILE *mf = fopen("/proc/meminfo", "r");
+    unsigned long mem_kb = 0;
+    if (mf) { fscanf(mf, "MemTotal: %lu", &mem_kb); fclose(mf); }
+    if (mem_kb && mem_kb < 7ul * 1024 * 1024 && !getenv("LARECOMP_HEAP_ANY_RAM")) {
+        LOG("[vk] %lu MB of RAM: the guest heap stays copied (LARECOMP_HEAP_ANY_RAM=1 places it anyway)\n", mem_kb / 1024);
+        if (gcopy_linux) plat_write_tracking_enable(HEAP_BASE, HEAP_BASE + HEAP_MAX);
+        return false;
+    }
+    uint64_t align = g_vk.placed_align > 65536 ? g_vk.placed_align : 65536;
+    size = (size + align - 1) & ~(align - 1);
+    if ((HEAP_BASE & (align - 1)) || size > HEAP_MAX) {
+        LOG("[vk] guest heap cannot be placed (alignment %llu, size %llu MB)\n",
+            (unsigned long long)align, (unsigned long long)(size >> 20));
+        if (gcopy_linux) plat_write_tracking_enable(HEAP_BASE, HEAP_BASE + HEAP_MAX);
+        return false;
+    }
+    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = size,
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                 VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+    VkBuffer buf = VK_NULL_HANDLE;
+    if (vkCreateBuffer(g_vk.dev, &bi, NULL, &buf) != VK_SUCCESS) {
+        if (gcopy_linux) plat_write_tracking_enable(HEAP_BASE, HEAP_BASE + HEAP_MAX);
+        return false;
+    }
+    VkMemoryRequirements mr;
+    vkGetBufferMemoryRequirements(g_vk.dev, buf, &mr);
+    VkPhysicalDeviceMemoryProperties mp;
+    vkGetPhysicalDeviceMemoryProperties(g_vk.phys, &mp);
+    int mt = -1;
+    const VkMemoryPropertyFlags need = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    for (uint32_t i = 0; i < mp.memoryTypeCount; i++) {
+        VkMemoryPropertyFlags f = mp.memoryTypes[i].propertyFlags;
+        if (!(mr.memoryTypeBits & (1u << i)) || (f & need) != need) continue;
+        if (mt < 0 || (f & VK_MEMORY_PROPERTY_HOST_CACHED_BIT)) mt = (int)i;
+        if (f & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) break;
+    }
+    VkResult r = VK_ERROR_FEATURE_NOT_PRESENT;
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    if (mt >= 0) {
+        VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size, .memoryTypeIndex = (uint32_t)mt};
+        r = vkAllocateMemory(g_vk.dev, &ai, NULL, &mem);
+        if (r == VK_SUCCESS) r = vkBindBufferMemory(g_vk.dev, buf, mem, 0);
+    }
+    if (r != VK_SUCCESS) {
+        LOG("[vk] guest heap placement failed (%d); shader global memory through CPU copies\n", (int)r);
+        if (mem) vkFreeMemory(g_vk.dev, mem, NULL);
+        vkDestroyBuffer(g_vk.dev, buf, NULL);
+        if (gcopy_linux) plat_write_tracking_enable(HEAP_BASE, HEAP_BASE + HEAP_MAX);
+        return false;
+    }
+    VkMemoryMapPlacedInfoEXT pl = {.sType = VK_STRUCTURE_TYPE_MEMORY_MAP_PLACED_INFO_EXT, .pPlacedAddress = (void *)(uintptr_t)HEAP_BASE};
+    VkMemoryMapInfoKHR mi = {.sType = VK_STRUCTURE_TYPE_MEMORY_MAP_INFO_KHR, .flags = VK_MEMORY_MAP_PLACED_BIT_EXT,
+                             .memory = mem, .size = VK_WHOLE_SIZE, .pNext = &pl};
+    void *mapped = NULL;
+    PFN_vkMapMemory2KHR map2 = (PFN_vkMapMemory2KHR)vkGetDeviceProcAddr(g_vk.dev, "vkMapMemory2KHR");
+    r = map2 ? map2(g_vk.dev, &mi, &mapped) : VK_ERROR_EXTENSION_NOT_PRESENT;
+    if (r != VK_SUCCESS || mapped != (void *)(uintptr_t)HEAP_BASE) {
+        LOG("[vk] guest heap placement failed (%d); shader global memory through CPU copies\n", (int)r);
+        if (mem) vkFreeMemory(g_vk.dev, mem, NULL);  // freeing a placed map unmaps it
+        if (mapped == (void *)(uintptr_t)HEAP_BASE) plat_reset_guest(HEAP_BASE, HEAP_BASE + size);
+        vkDestroyBuffer(g_vk.dev, buf, NULL);
+        if (gcopy_linux) plat_write_tracking_enable(HEAP_BASE, HEAP_BASE + HEAP_MAX);
+        return false;
+    }
+    gmem_buf = buf;
+    gmem_mem = mem;
+    gmem_size = size;
+    gcopy_linux = false;
+    gwin_mode = size > g_vk.props.limits.maxStorageBufferRange && !getenv("LARECOMP_VK_NO_GWIN");
+    LOG("[vk] guest heap %llu MB is GPU memory (placed at 0x%llx, align %llu)%s\n", (unsigned long long)(size >> 20),
+        (unsigned long long)HEAP_BASE, (unsigned long long)align,
+        gwin_mode ? "; draws reach global memory through windows" : "");
+    return true;
+}
+#endif
+
 #ifdef __ANDROID__
 // Turnip (VK_EXT_map_memory_placed): the guest heap *is* GPU memory. When the game sets its heap size (kernel.c
 // SetHeapSize, before it writes there), host-visible device memory is mapped over the heap's range at HEAP_BASE itself
@@ -4354,13 +4476,14 @@ static VkDescriptorBufferInfo gmem_info(void) {
         LOG("[vk] guest heap import failed (%llu MB): shader global memory reads return zero\n", (unsigned long long)(want >> 20));
         off = 1;
     }
-#ifdef __ANDROID__
-    if (gmem_buf) {  // (a storage buffer's range is limited: 2 GB on Adreno; the heap may be larger)
+#if defined(__ANDROID__) || defined(__linux__)
+    if (gmem_buf) {  // (a storage buffer's range is limited: 128 MB on Adreno 6xx Turnip, 2 GB on later Adreno; the heap may be larger)
         uint64_t range = gmem_size < g_vk.props.limits.maxStorageBufferRange ? gmem_size : g_vk.props.limits.maxStorageBufferRange & ~3ull;
         return (VkDescriptorBufferInfo){gmem_buf, 0, range};
     }
-#endif
+#else
     if (gmem_buf) return (VkDescriptorBufferInfo){gmem_buf, 0, gmem_size};
+#endif
     static uint32_t zero[1024];
     VkSpan s = vk_transient_copy(zero, sizeof zero, 256);
     return (VkDescriptorBufferInfo){s.buf, s.off, sizeof zero};
@@ -4381,14 +4504,17 @@ static uint32_t gmap_tab[(GMAP_MAX + 1) * 4];  // this dispatch's table (stage_s
 static VkBufferCopy gfast_cp[GMAP_MAX];       // its copies heap -> gfast_buf (reversed after a storing dispatch)
 static int gfast_n;
 
-#ifdef __ANDROID__
-static VkDescriptorBufferInfo gfast_win;  // (gfast_prepare, heap placed: a window of the heap instead of a copy)
+#if defined(__ANDROID__) || defined(__linux__)
+static VkDescriptorBufferInfo gfast_win;  // (a window of the heap instead of a device-local copy)
 #endif
 
 static VkDescriptorBufferInfo gfast_info(void) {
-#ifdef __ANDROID__
+#if defined(__ANDROID__)
     if ((gcopy_mode || gwin_mode) && gc_size) return (VkDescriptorBufferInfo){gc_span.buf, gc_span.off, gc_size};
     if (gfast_win.buffer) return gfast_win;
+#elif defined(__linux__)
+    if ((gwin_mode || gcopy_linux) && gc_size) return (VkDescriptorBufferInfo){gc_span.buf, gc_span.off, gc_size};
+    if (gwin_mode && gfast_win.buffer) return gfast_win;
 #endif
     if (!gfast_buf) {
         VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = GFAST_SIZE,
@@ -4405,9 +4531,14 @@ static void gfast_prepare(VkCommandBuffer cb) {
     if (on < 0) { const char *e = getenv("LARECOMP_VK_GMEM_FAST"); on = !e || atoi(e) != 0; }
     memset(gmap_tab, 0, sizeof gmap_tab);
     gfast_n = 0;
-#ifdef __ANDROID__
+#if defined(__ANDROID__)
     gfast_win = (VkDescriptorBufferInfo){0};
     if (!gcopy_mode) gc_size = 0;  // (a draw's gsnap_prepare copy: not this dispatch's)
+#elif defined(__linux__)
+    if (gwin_mode) {  // (a draw's window or gsnap copy: not this dispatch's)
+        gfast_win = (VkDescriptorBufferInfo){0};
+        gc_size = 0;
+    }
 #endif
     gmem_info();  // (the heap import, made on first use)
     gfast_info();
@@ -5233,6 +5364,161 @@ static void gcopy_prepare(unsigned stage_mask, bool store) {
 }
 #endif
 
+#ifdef __linux__
+// Linux has no placed heap. The imported guest heap is still one storage buffer, and Turnip rejects a range past
+// maxStorageBufferRange, so the same window Android builds for a placed heap applies: the draw's bound global
+// buffers are listed in GMap and the descriptor starts at the first of them. A small vertex-only load (BOTW's
+// glyphs, rewritten each frame) is copied as the draw is recorded, so the GPU does not sample the next frame's text.
+static void gwin_prepare(unsigned stage_mask) {
+    memset(gmap_tab, 0, sizeof gmap_tab);
+    gfast_n = 0;
+    gc_size = 0;
+    gmem_info();
+    uint64_t reach = g_vk.props.limits.maxStorageBufferRange & ~3ull;
+    gfast_win = (VkDescriptorBufferInfo){gmem_buf, 0, reach < gmem_size ? reach : gmem_size};
+    if (!gmem_buf) return;
+    struct { uint64_t lo, hi; } r[6 * 16];
+    int n = 0;
+    for (int s = 0; s < 6; s++) {
+        if (!(stage_mask & (1u << s))) continue;
+        for (int i = 0; i < 16; i++) {
+            uint64_t a = st.sbuf[s][i].addr, sz = st.sbuf[s][i].size;
+            if (!a || !sz || a < HEAP_BASE || a - HEAP_BASE + sz > gmem_size) continue;
+            uint64_t lo = (a - HEAP_BASE) & ~255ull, hi = (a - HEAP_BASE + sz + 255) & ~255ull;
+            lo = lo > 4096 ? (lo - 4096) & ~255ull : 0;
+            if (hi > gmem_size) hi = gmem_size;
+            int k = n++;
+            while (k > 0 && r[k - 1].lo > lo) { r[k] = r[k - 1]; k--; }
+            r[k].lo = lo; r[k].hi = hi;
+        }
+    }
+    int m = 0;
+    for (int i = 0; i < n; i++) {
+        if (m && r[i].lo <= r[m - 1].hi + 4096) { if (r[i].hi > r[m - 1].hi) r[m - 1].hi = r[i].hi; }
+        else r[m++] = r[i];
+    }
+    if (!m) return;
+    uint64_t al = g_vk.props.limits.minStorageBufferOffsetAlignment ? g_vk.props.limits.minStorageBufferOffsetAlignment : 256;
+    uint64_t base = r[0].lo / al * al;
+    if (reach > gmem_size - base) reach = gmem_size - base;
+    int k = 0;
+    for (int i = 0; i < m && k < GMAP_MAX; i++) {
+        if (r[i].hi - base > reach) break;
+        gmap_tab[k * 4 + 0] = (uint32_t)r[i].lo;
+        gmap_tab[k * 4 + 1] = (uint32_t)(r[i].hi - r[i].lo);
+        gmap_tab[k * 4 + 2] = (uint32_t)((r[i].lo - base) >> 2);
+        k++;
+    }
+    gmap_tab[GMAP_MAX * 4] = (uint32_t)k;
+    gfast_win = (VkDescriptorBufferInfo){gmem_buf, base, reach};
+}
+
+static bool gsnap_prepare(void) {
+    memset(gmap_tab, 0, sizeof gmap_tab);
+    gfast_n = 0;
+    gc_size = 0;
+    struct { uint64_t lo, hi; } r[16];
+    int n = 0;
+    for (int i = 0; i < 16; i++) {
+        uint64_t a = st.sbuf[0][i].addr, sz = st.sbuf[0][i].size;
+        if (!a || !sz || a < HEAP_BASE || a - HEAP_BASE + sz > gmem_size) continue;
+        uint64_t lo = (a - HEAP_BASE) & ~255ull, hi = (a - HEAP_BASE + sz + 255) & ~255ull;
+        if (hi > gmem_size) hi = gmem_size;
+        int k = n++;
+        while (k > 0 && r[k - 1].lo > lo) { r[k] = r[k - 1]; k--; }
+        r[k].lo = lo; r[k].hi = hi;
+    }
+    int m = 0;
+    uint64_t total = 0;
+    for (int i = 0; i < n; i++) {
+        if (m && r[i].lo <= r[m - 1].hi) { if (r[i].hi > r[m - 1].hi) r[m - 1].hi = r[i].hi; }
+        else r[m++] = r[i];
+    }
+    for (int i = 0; i < m; i++) total += r[i].hi - r[i].lo;
+    if (!m || m > GMAP_MAX || total > (64u << 10)) return false;
+    gc_span = vk_transient(total, 256);
+    uint64_t off = 0;
+    for (int i = 0; i < m; i++) {
+        uint64_t len = r[i].hi - r[i].lo;
+        memcpy((uint8_t *)gc_span.ptr + off, (const void *)(uintptr_t)(HEAP_BASE + r[i].lo), len);
+        gmap_tab[i * 4 + 0] = (uint32_t)r[i].lo;
+        gmap_tab[i * 4 + 1] = (uint32_t)len;
+        gmap_tab[i * 4 + 2] = (uint32_t)(off >> 2);
+        off += len;
+    }
+    gc_size = total;
+    gmap_tab[GMAP_MAX * 4] = (uint32_t)m;
+    return true;
+}
+
+// No VK_EXT_external_memory_host: the bound global-memory ranges are copied into the transient ring and the shader's
+// GMap points there. Stores are copied back once that submission has finished (linux_gcopy_retire). A range list
+// bigger than one 64 MB chunk is left unread, the same limit as Android's plain copies.
+typedef struct { uint8_t *src; uint64_t addr, len, seq; } LinuxGcBack;
+static LinuxGcBack linux_gc_back[256];
+static int linux_gc_nback;
+
+static void linux_gcopy_retire(uint64_t done) {
+    int k = 0;
+    for (int i = 0; i < linux_gc_nback; i++) {
+        if (linux_gc_back[i].seq <= done)
+            memcpy((void *)(uintptr_t)linux_gc_back[i].addr, linux_gc_back[i].src, linux_gc_back[i].len);
+        else linux_gc_back[k++] = linux_gc_back[i];
+    }
+    linux_gc_nback = k;
+}
+
+static void linux_gcopy_prepare(unsigned stage_mask, bool store) {
+    memset(gmap_tab, 0, sizeof gmap_tab);
+    gfast_n = 0;
+    gc_size = 0;
+    gfast_win = (VkDescriptorBufferInfo){0};
+    struct { uint64_t lo, hi; } r[6 * 16];
+    int n = 0;
+    for (int s = 0; s < 6; s++) {
+        if (!(stage_mask & (1u << s))) continue;
+        for (int i = 0; i < 16; i++) {
+            uint64_t a = st.sbuf[s][i].addr, sz = st.sbuf[s][i].size;
+            if (!a || !sz || a < HEAP_BASE || a - HEAP_BASE + sz > HEAP_MAX) continue;
+            uint64_t lo = (a - HEAP_BASE) & ~255ull, hi = (a - HEAP_BASE + sz + 255) & ~255ull;
+            lo = lo > 4096 ? (lo - 4096) & ~255ull : 0;
+            if (hi > HEAP_MAX) hi = HEAP_MAX;
+            int k = n++;
+            while (k > 0 && r[k - 1].lo > lo) { r[k] = r[k - 1]; k--; }
+            r[k].lo = lo; r[k].hi = hi;
+        }
+    }
+    int m = 0;
+    for (int i = 0; i < n; i++) {
+        if (m && r[i].lo <= r[m - 1].hi + 4096) { if (r[i].hi > r[m - 1].hi) r[m - 1].hi = r[i].hi; }
+        else r[m++] = r[i];
+    }
+    if (m > GMAP_MAX) m = GMAP_MAX;
+    uint64_t total = 0;
+    for (int i = 0; i < m; i++) total += (r[i].hi - r[i].lo + 255) & ~255ull;
+    if (!m) return;
+    if (total > CHUNK_SIZE) {
+        static int told;
+        if (!told++) LOG("[vk] global memory copy is %llu MB: left unread\n", (unsigned long long)(total >> 20));
+        return;
+    }
+    gc_span = vk_transient(total, 256);
+    uint64_t off = 0, seq = vk_pending_seq();
+    for (int i = 0; i < m; i++) {
+        uint64_t len = r[i].hi - r[i].lo;
+        memcpy((uint8_t *)gc_span.ptr + off, (const void *)(uintptr_t)(HEAP_BASE + r[i].lo), len);
+        gmap_tab[i * 4 + 0] = (uint32_t)r[i].lo;
+        gmap_tab[i * 4 + 1] = (uint32_t)len;
+        gmap_tab[i * 4 + 2] = (uint32_t)(off >> 2);
+        if (store && linux_gc_nback < 256)
+            linux_gc_back[linux_gc_nback++] = (LinuxGcBack){(uint8_t *)gc_span.ptr + off, HEAP_BASE + r[i].lo, len, seq};
+        off += (len + 255) & ~255ull;
+    }
+    gc_size = total;
+    gmap_tab[GMAP_MAX * 4] = (uint32_t)m;
+}
+#endif
+
 // ---- vertex / index cache
 // Reading vertex / index data in place from the imported heap crosses PCIe for every vertex fetched on a discrete GPU
 // (outdoors at 3x internal resolution on an RTX 3080 Ti: ~0.7-1.9 ms of GPU a frame; more on PCIe 3.0), and copying it
@@ -5508,6 +5794,10 @@ void vk_exec_reset(void) {
         gmem_mem = VK_NULL_HANDLE;
     }
     gmem_size = gmem_tried = 0;
+#ifdef __linux__
+    gfast_win = (VkDescriptorBufferInfo){0};
+    gc_size = 0;
+#endif
     g_inplace_copy = -1;  // (the next boot reads the setting again: resolve_feedback)
 #ifdef __ANDROID__
     gcopy_mode = !g_vk.host_import && !getenv("LARECOMP_VK_NO_GCOPY");  // (until the next heap is placed: vk_heap_place)
@@ -5849,6 +6139,8 @@ static CsProg *compute_program(NvnProgram *np) {
     maxwell_no_local_struct = qcom_no_switch() && !getenv("LARECOMP_QCOM_LOCAL");
     maxwell_native_half = !getenv("LARECOMP_BITWISE_HALF");
     maxwell_fast_minmax = !getenv("LARECOMP_SAFE_MATH");
+#elif defined(__linux__)
+    maxwell_gmem_map_all = gwin_mode || gcopy_linux;
 #endif
     ShaderKey k = {0};
     k.glsl = 1;
@@ -5942,11 +6234,18 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
     if (gcopy_mode && cp->si->uses_gmem_map) gcopy_prepare(1u << 5, cp->si->uses_gmem_store);
     else
 #endif
+#ifdef __linux__
+    if (gcopy_linux && cp->si->uses_gmem_map) linux_gcopy_prepare(1u << 5, cp->si->uses_gmem_store);
+    else
+#endif
     if (cp->si->uses_gmem_map) gfast_prepare(cb);
     VkDescriptorSet ds = stage_set(&cp->p, cp->p.set_layout[0], 0, 5, cp->si, NULL, NULL, gx, gy, gz, NULL, NULL, NULL);
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, cp->pipe);
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, cp->p.layout, 0, 1, &ds, 0, NULL);
     vkCmdDispatch(cb, gx, gy, gz);
+#ifdef __linux__
+    if (!(gcopy_linux && cp->si->uses_gmem_map))
+#endif
     if (cp->si->uses_gmem_map && cp->si->uses_gmem_store) gfast_finish(cb);
     if (cp->si->uses_gmem_store) vc_mark_sbufs(5), note_gmem_store(5);
     stat_dispatches++;
@@ -6686,6 +6985,16 @@ static void draw_(CmdRec *r, bool indexed) {
         if (!(snap && pr->vi->uses_gmem_map && !pr->fi->uses_gmem_map && !pr->vi->uses_gmem_store && gsnap_prepare()))
             gwin_prepare((pr->vi->uses_gmem_map ? 1u : 0u) | (pr->fi->uses_gmem_map ? 2u : 0u));
     }
+#elif defined(__linux__)
+    if (gcopy_linux && (pr->vi->uses_gmem_map || pr->fi->uses_gmem_map))
+        linux_gcopy_prepare((pr->vi->uses_gmem_map ? 1u : 0u) | (pr->fi->uses_gmem_map ? 2u : 0u),
+                            pr->vi->uses_gmem_store || pr->fi->uses_gmem_store);
+    else if (gwin_mode && (pr->vi->uses_gmem_map || pr->fi->uses_gmem_map)) {
+        static int snap = -1;  // (LARECOMP_NO_GSNAP=1: through the window as before)
+        if (snap < 0) snap = getenv("LARECOMP_NO_GSNAP") == NULL;
+        if (!(snap && pr->vi->uses_gmem_map && !pr->fi->uses_gmem_map && !pr->vi->uses_gmem_store && gsnap_prepare()))
+            gwin_prepare((pr->vi->uses_gmem_map ? 1u : 0u) | (pr->fi->uses_gmem_map ? 2u : 0u));
+    }
 #endif
     uint32_t dyn[64], ndv = 0, ndf = 0;  // (the sets' dynamic uniform buffer offsets: vertex, then fragment)
     memset(cbw_patch, 0, sizeof cbw_patch);  // (cbwin_bind fills them while the sets are written)
@@ -6820,7 +7129,7 @@ static void draw_(CmdRec *r, bool indexed) {
                 scan_src = src; scan_isz = isz; scan_restart = restart;  // max_index only if a stream gets copied
             } else {
                 ib = vk_transient_copy(src, (uint64_t)count * isz + 4, 4);
-#ifdef __ANDROID__
+#if defined(__ANDROID__) || defined(__linux__)
                 // (no primitive restart - most draws: a plain maximum, which the compiler vectorizes; the scalar
                 // loop with the restart test was ~9% of the render thread in the copy mode, every indexed draw)
                 if (!st.prim_restart) {

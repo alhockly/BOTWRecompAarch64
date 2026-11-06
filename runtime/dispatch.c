@@ -1,4 +1,5 @@
 // Guest address -> recompiled function lookup, and host (HLE) function registry.
+#define _GNU_SOURCE  // glibc: Dl_info / dladdr
 #include <pthread.h>
 #include <sched.h>
 #include <signal.h>

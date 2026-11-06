@@ -106,11 +106,17 @@ int framepace_target(void) {
     // (Video > Frame rate: 20, 30, 40 / 45, 60; Auto is 60 here - the clock follows whatever the frames really take.
     // 40 / 45: whichever the screen shows evenly, vulkan/device.c vk_between_fps - the game in its 60 fps way)
     extern int vk_between_fps(void);
-    int fps = forced >= 0 ? forced : g_settings.fps_mode == 1 ? 30 : g_settings.fps_mode == 3 ? 20
-            : g_settings.fps_mode == 4 ? vk_between_fps() : 60;
+#ifdef __ANDROID__
+    int mode = g_settings.fps_mode;
+    bool unlock = g_settings.event_fps_unlock;
+#else
+    int mode = 0;       // the game's own 30/60 choice, paced at 60
+    bool unlock = false;
+#endif
+    int fps = forced >= 0 ? forced : mode == 1 ? 30 : mode == 3 ? 20 : mode == 4 ? vk_between_fps() : 60;
     if (movie > 0 && __atomic_load_n(&g_movie_playing, __ATOMIC_RELAXED) > 0 && (fps == 0 || fps > movie)) fps = movie;
     if (menu > 0 && (fps == 0 || fps > menu) && in_menu()) fps = menu;
-    int ev = event >= 0 ? event : g_settings.event_fps_unlock ? 0 : 30;
+    int ev = event >= 0 ? event : unlock ? 0 : 30;
     if (ev > 0 && (fps == 0 || fps > ev) && in_event()) fps = ev;
     return fps;
 }
@@ -197,9 +203,14 @@ void rt_vfr_update(uint64_t vfr) {
         // the frame loop's interval (nvn/objects.c, following this one) and the clock's ratio not matching meanwhile,
         // and Link sank into the ground going from 20 to 30 fps (2026-11-02)
         static int last_mode = -1;
-        if (g_settings.fps_mode != last_mode) {
+#ifdef __ANDROID__
+        int mode = g_settings.fps_mode;
+#else
+        int mode = 0;
+#endif
+        if (mode != last_mode) {
             if (last_mode >= 0) slow = period * 30;
-            last_mode = g_settings.fps_mode;
+            last_mode = mode;
         }
         smooth += (s - smooth) * 0.05;
         real += s;
@@ -226,8 +237,11 @@ void rt_vfr_update(uint64_t vfr) {
     uint32_t iv = g_vfr_iv;
     // (Frame rate 40 / 45: the game's 60 fps way, interval 1, whatever the ratio - at 40 (0.75) the rule below kept 2
     // while the frame loop ran at 1 (nvn/objects.c), the mismatch that sank Link at 20 fps)
+#ifdef __ANDROID__
     if (g_settings.fps_mode == 4) iv = 1, slow = ratio;
-    else if (iv == 1 && slow > 0.85) iv = 2;
+    else
+#endif
+    if (iv == 1 && slow > 0.85) iv = 2;
     else if (iv == 2 && slow < 0.7) iv = 1;
     else if (iv == 2 && slow > 1.3) iv = 3;
     else if (iv == 3 && slow < 1.15) iv = 2;

@@ -158,9 +158,14 @@ void widescreen_talk_seen(void) {
 // cut in half (#220). Right after a menu (the pause, the inventory) too: widescreen_world_play waits 30 frames, and the
 // minimap showed down in its usual place for a second, then jumped up (#229, #220); its own disc tells it's back.
 float widescreen_hud_top(float x, float y) {
+#ifdef __ANDROID__
     extern bool touch_hud_top(void);
+    bool hud = touch_hud_top();
+#else
+    bool hud = false;
+#endif
     extern uint64_t renderer_present_count(void);
-    if (x < 290.0f || y > -140.0f || y < -315.0f || !touch_hud_top() || !in_world() || framepace_in_menu()) return 0;
+    if (x < 290.0f || y > -140.0f || y < -315.0f || !hud || !in_world() || framepace_in_menu()) return 0;
     if (!minimap_frame || renderer_present_count() - minimap_frame > 3) return 0;
     return 490.0f;
 }

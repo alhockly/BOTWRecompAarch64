@@ -14,7 +14,7 @@
 #include <strings.h>
 
 #include "../hle.h"
-#ifdef __ANDROID__
+#if defined(__ANDROID__) || defined(__linux__)
 #include "../paths.h"  // (rt_resource: the font shipped with the app)
 #endif
 
@@ -125,9 +125,10 @@ static void load_fonts(void) {
                          "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf"};
     for (size_t i = 0; i < sizeof std / sizeof *std && !fonts[0].addr; i++)
         if (std[i]) load_one(std[i], &fonts[0]);
-#ifdef __ANDROID__
-    {   // DejaVu Sans, shipped with the app (android/deps): Android's own fonts are CFF (Noto Sans CJK) or lack glyphs
-        // the game asks for (Roboto: U+25A1, a null glyph the game doesn't expect)
+#if defined(__ANDROID__) || defined(__linux__)
+    {   // DejaVu Sans, shipped with the app. Android's own fonts are CFF (Noto Sans CJK) or lack glyphs the game asks
+        // for (Roboto: U+25A1). Fedora's Noto Sans CJK is CFF too, which this font engine crashes on, and DejaVu is
+        // not installed there. A Switch dump in fonts/ still wins, above.
         char p[1100];
         if (!fonts[0].addr && rt_resource("DejaVuSans.ttf", NULL, p, sizeof p)) load_one(p, &fonts[0]);
     }

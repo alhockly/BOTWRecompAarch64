@@ -37,12 +37,13 @@ typedef struct {
     bool motion;          // the phone's (or a controller's) gyroscope as the controller's motion sensor (hle/motion.c)
     int motion_source;    // whose: 0 automatic (a controller's once its gyroscope is alive), 1 the phone's, 2 a controller's
     bool motion_flat;     // the phone's sensors as the Switch's screen in handheld mode, not a flat controller (hle/motion.c)
+    int fps_mode;         // 0: the game's own choice (30 / 60), 1: 30 fps, 2: 60 fps, 3: 20 fps, 4: 40/45 fps
+    bool event_fps_unlock;  // in-game cutscenes at the chosen frame rate, not 30 (hle/framepace.c)
+    float stick_deadzone;  // a controller's sticks: a round dead zone (share of the travel, 0-0.4). 0: the game's own only
 #ifdef __ANDROID__
     bool touch_controls;  // on-screen controls while no controller is connected (ui/touch_controls.mm)
     int overlay_style;    // Show FPS's overlay (ui/perf_overlay.mm): 0 full, 1 compact (one line)
     float overlay_pos[2]; // its top left, a share of the screen, dragged there with a finger (negative: the corner)
-    bool event_fps_unlock;  // in-game cutscenes and talks at the chosen frame rate, not 30 (hle/framepace.c)
-    int fps_mode;         // 0: the game's own choice (30 / 60, the frame pacer), 1: 30 fps, 2: 60 fps, 3: 20 fps, 4: 45 fps
     bool shader_int32;    // shader address math in 32-bit words even where the driver offers 64-bit (vulkan/exec.c)
     bool native_code;     // Android: the game's own code on the CPU, no build of it (runtime/native.c); off by default
     bool files_in_place;  // Android: a setup reads the picked romfs/ where it is, no copy (services/fs.c); off by default
@@ -77,8 +78,6 @@ typedef struct {
     // area a whole half of the screen
     bool touch_drag_camera, touch_sticks_hidden, touch_half_areas;
     float touch_drag_sens;
-    float stick_deadzone;  // a controller's sticks: a round dead zone (share of the travel, 0-0.4), rescaled past it
-                           // (hle/input.c): worn sticks that drift. 0: the game's own only
 #endif
     int language;        // LANG_AUTO or an index into g_language_codes: the game's text language
     bool aspect_asked;   // the start screen's one-time "authentic 16:9 or unlocked?" question was answered

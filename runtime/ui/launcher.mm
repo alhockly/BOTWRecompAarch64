@@ -1472,7 +1472,9 @@ static void carry_game_code(int version) {
         if (!line.empty() && line.compare(0, 11, "native_code")) text += line + "\n";
         fclose(f);
     }
+#ifdef __ANDROID__
     text += std::string("native_code = ") + (g_settings.native_code ? "1" : "0") + "\n";
+#endif
     f = fopen(path.c_str(), "wb");
     if (f) fputs(text.c_str(), f), fclose(f);
 }
@@ -1796,12 +1798,22 @@ static void prelaunch_tab(float sc) {
     heading("Game font");
     import_fonts();
     bool fs = have_font(FONT_STD, 4), fe = have_font(FONT_EXT, 2);
+#ifdef __linux__
+    ImGui::Text(tr("Text: %s    Button icons: %s"),
+                tr(fs ? "Nintendo font (imported)" : "substitute (DejaVu Sans)"),
+                tr(fe ? "imported" : "substitute"));
+    ImGui::PushTextWrapPos(0);
+    ImGui::TextDisabled("%s", tr("DejaVu Sans is included, so text works without a Switch dump. For the original look, dump the fonts from your own Switch and import: "
+                                 "nintendo_udsg-r_std_003.bfttf (text) and nintendo_ext_003.bfttf (button icons). "
+                                 ".ttf versions with the same names work too."));
+#else
     ImGui::Text(tr("Text: %s    Button icons: %s"), tr(fs ? "Nintendo font (imported)" : "substitute (Hiragino Sans)"),
                 tr(fe ? "imported" : "substitute"));
     ImGui::PushTextWrapPos(0);
     ImGui::TextDisabled("%s", tr("Fonts aren't included. For the original look, dump them from your own Switch and import: "
                                  "nintendo_udsg-r_std_003.bfttf (text) and nintendo_ext_003.bfttf (button icons). "
                                  ".ttf versions with the same names work too."));
+#endif
     ImGui::PopTextWrapPos();
     if (!g_font_msg.empty()) ImGui::Text("%s", tr(g_font_msg.c_str()));
     static const SDL_DialogFileFilter font_f[] = {{"Switch fonts", "bfttf;ttf"}};

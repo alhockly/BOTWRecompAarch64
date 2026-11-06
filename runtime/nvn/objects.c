@@ -1,4 +1,5 @@
 // NVN objects, builders, and state objects (everything except command recording).
+#define _GNU_SOURCE  // glibc: gettid
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>

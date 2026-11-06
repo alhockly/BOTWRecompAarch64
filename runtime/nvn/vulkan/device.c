@@ -467,25 +467,27 @@ static void create_device(void) {
     vkEnumerateDeviceExtensionProperties(g_vk.phys, NULL, &ne, ep);
     if (getenv("LARECOMP_VK_LIST_EXT"))  // (=1: the driver's device extensions, for comparing drivers)
         for (uint32_t i = 0; i < ne; i++) LOG("[vk] device extension %s %u\n", ep[i].extensionName, ep[i].specVersion);
-#ifdef __ANDROID__
     // An advertised extension does not imply every optional feature bit is supported.
     VkPhysicalDeviceCustomBorderColorFeaturesEXT border_have = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT};
     VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT divisor_have = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT};
     VkPhysicalDeviceFaultFeaturesEXT fault_have = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
+#ifdef __ANDROID__
     VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR executable_have = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR};
+#endif
     VkPhysicalDeviceFeatures2 optional = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
 #define QUERY_OPTIONAL(name, feature) do { if (has_ext(ep, ne, name)) { \
         feature.pNext = optional.pNext; optional.pNext = &feature; } } while (0)
     QUERY_OPTIONAL(VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME, border_have);
     QUERY_OPTIONAL(VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME, divisor_have);
     QUERY_OPTIONAL(VK_EXT_DEVICE_FAULT_EXTENSION_NAME, fault_have);
+#ifdef __ANDROID__
     QUERY_OPTIONAL(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME, executable_have);
+#endif
 #undef QUERY_OPTIONAL
     vkGetPhysicalDeviceFeatures2(g_vk.phys, &optional);
-#endif
     const char *ext[32];
     uint32_t n_ext = 0;
     ext[n_ext++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
@@ -506,20 +508,16 @@ static void create_device(void) {
     bool driver_props = g_vk.api >= VK_API_VERSION_1_2 || has_ext(ep, ne, VK_KHR_DRIVER_PROPERTIES_EXTENSION_NAME);
 #endif
     g_vk.custom_border = has_ext(ep, ne, VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME);
-#ifdef __ANDROID__
     if (g_vk.custom_border && !vk_backend_border_supported(&border_have)) {
         LOG("[vk-cap] custom border disabled: renderer needs customBorderColors and customBorderColorWithoutFormat\n");
         g_vk.custom_border = false;
     }
-#endif
     if (g_vk.custom_border) ext[n_ext++] = VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME;
     g_vk.divisor = has_ext(ep, ne, VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME);
-#ifdef __ANDROID__
     if (g_vk.divisor && !divisor_have.vertexAttributeInstanceRateDivisor) {
         LOG("[vk-cap] instance divisor extension disabled: vertexAttributeInstanceRateDivisor unavailable\n");
         g_vk.divisor = false;
     }
-#endif
     if (g_vk.divisor) ext[n_ext++] = VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME;
     g_vk.host_import = has_ext(ep, ne, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);  // guest heap as a GPU buffer (exec.c)
 #ifdef __ANDROID__
@@ -550,12 +548,10 @@ static void create_device(void) {
 #endif
     if (g_vk.host_import) ext[n_ext++] = VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME;
     bool fault = has_ext(ep, ne, VK_EXT_DEVICE_FAULT_EXTENSION_NAME);  // device-lost diagnostics (vk_device_fault_report)
-#ifdef __ANDROID__
     if (fault && !fault_have.deviceFault) {
         LOG("[vk-cap] device-fault diagnostics disabled: deviceFault unavailable\n");
         fault = false;
     }
-#endif
     if (fault) ext[n_ext++] = VK_EXT_DEVICE_FAULT_EXTENSION_NAME;
     g_fault_ext = fault;
 #ifdef __ANDROID__
@@ -589,6 +585,26 @@ static void create_device(void) {
     const char *pv = getenv("LARECOMP_PACE_VSYNC");
     display_timing = has_ext(ep, ne, VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME) && (!pv || atoi(pv));
     if (display_timing) ext[n_ext++] = VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME;
+#elif defined(__linux__)
+    // Turnip: the guest heap mapped at HEAP_BASE (exec.c vk_heap_place). Not on llvmpipe. LARECOMP_VK_NO_PLACED=1: copies.
+    bool vk_driver_is_turnip(void);
+    LOG("[vk-cap] memory export: placed maps %s, host import %s\n",
+        has_ext(ep, ne, VK_EXT_MAP_MEMORY_PLACED_EXTENSION_NAME) ? "yes" : "no", g_vk.host_import ? "yes" : "no");
+    if (vk_driver_is_turnip() && !getenv("LARECOMP_VK_NO_PLACED") &&
+        has_ext(ep, ne, VK_EXT_MAP_MEMORY_PLACED_EXTENSION_NAME) && has_ext(ep, ne, VK_KHR_MAP_MEMORY_2_EXTENSION_NAME)) {
+        VkPhysicalDeviceMapMemoryPlacedFeaturesEXT pf = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_FEATURES_EXT};
+        VkPhysicalDeviceFeatures2 q = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &pf};
+        vkGetPhysicalDeviceFeatures2(g_vk.phys, &q);
+        VkPhysicalDeviceMapMemoryPlacedPropertiesEXT pp = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_PROPERTIES_EXT};
+        VkPhysicalDeviceProperties2 qp = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &pp};
+        vkGetPhysicalDeviceProperties2(g_vk.phys, &qp);
+        if (pf.memoryMapPlaced) {
+            g_vk.map_placed = true;
+            g_vk.placed_align = pp.minPlacedMemoryMapAlignment;
+            ext[n_ext++] = VK_KHR_MAP_MEMORY_2_EXTENSION_NAME;
+            ext[n_ext++] = VK_EXT_MAP_MEMORY_PLACED_EXTENSION_NAME;
+        }
+    }
 #endif
     free(ep);
 
@@ -813,6 +829,9 @@ static void create_device(void) {
 #else
     if (!h->shaderInt64) LOG("[vk] warning: no shaderInt64 (64-bit address math in shaders)\n");
 #endif
+#ifdef __linux__
+    VkPhysicalDeviceMapMemoryPlacedFeaturesEXT placed_lin = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_FEATURES_EXT};
+#endif
 #ifdef __ANDROID__
     VkPhysicalDeviceMapMemoryPlacedFeaturesEXT placed = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_FEATURES_EXT};
     if (g_vk.map_placed) {
@@ -835,6 +854,41 @@ static void create_device(void) {
     VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR pex = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR, .pipelineExecutableInfo = VK_TRUE};
     if (g_vk.exec_stats) { pex.pNext = f.pNext; f.pNext = &pex; }
+#else
+    // Desktop drivers can report Vulkan 1.3 and still lack bits this used to request unconditionally
+    // (Adreno 6xx Turnip: 8-bit and 16-bit storage, shaderInt8). vkCreateDevice then returns
+    // VK_ERROR_FEATURE_NOT_PRESENT. Ask for each bit only when the device has it.
+    VkPhysicalDeviceVulkan13Features cap13 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+    VkPhysicalDeviceVulkan12Features cap12 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, .pNext = &cap13};
+    VkPhysicalDeviceVulkan11Features cap11 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, .pNext = &cap12};
+    VkPhysicalDeviceFeatures2 cap = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &cap11};
+    vkGetPhysicalDeviceFeatures2(g_vk.phys, &cap);
+    g_vk.dyn_render = cap13.dynamicRendering;
+    g_vk.sync2 = cap13.synchronization2;
+    f13.dynamicRendering = g_vk.dyn_render;
+    f13.synchronization2 = g_vk.sync2;
+    f13.shaderDemoteToHelperInvocation = cap13.shaderDemoteToHelperInvocation;
+    f13.shaderTerminateInvocation = cap13.shaderTerminateInvocation;
+    f13.maintenance4 = cap13.maintenance4;
+    f12.timelineSemaphore = cap12.timelineSemaphore;
+    f12.shaderInt8 = cap12.shaderInt8;
+    f12.samplerMirrorClampToEdge = cap12.samplerMirrorClampToEdge;
+    f12.uniformAndStorageBuffer8BitAccess = cap12.uniformAndStorageBuffer8BitAccess;
+    f12.storageBuffer8BitAccess = cap12.storageBuffer8BitAccess;
+    f12.scalarBlockLayout = cap12.scalarBlockLayout;
+    f11.storageBuffer16BitAccess = cap11.storageBuffer16BitAccess;
+    LOG("[vk-cap] storage16 %u timeline %u mirror-clamp %u scalar %u dynamic-rendering %u sync2 %u demote %u terminate %u maintenance4 %u int8 %u storage8 %u uniform-storage8 %u\n",
+        cap11.storageBuffer16BitAccess, cap12.timelineSemaphore, cap12.samplerMirrorClampToEdge, cap12.scalarBlockLayout,
+        cap13.dynamicRendering, cap13.synchronization2, cap13.shaderDemoteToHelperInvocation, cap13.shaderTerminateInvocation,
+        cap13.maintenance4, cap12.shaderInt8, cap12.storageBuffer8BitAccess, cap12.uniformAndStorageBuffer8BitAccess);
+    if (!g_vk.dyn_render) LOG("[vk] no dynamic rendering: classic render passes\n");
+    if (!g_vk.sync2) FATAL("this Vulkan device has no synchronization2\n");
+    if (!cap12.timelineSemaphore) FATAL("this Vulkan device has no timeline semaphores\n");
+    if (g_vk.map_placed) {
+        placed_lin.memoryMapPlaced = VK_TRUE;
+        placed_lin.pNext = f.pNext;
+        f.pNext = &placed_lin;
+    }
 #endif
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = g_vk.qfam,
@@ -2045,6 +2099,8 @@ const char *vk_driver_desc(void) {
     return s;
 }
 
+#endif
+
 // Qualcomm's own driver (not Turnip): its shader compiler crashed on the structured control flow (vulkan/exec.c)
 bool vk_driver_is_qualcomm(void) {
     static int q = -1;
@@ -2068,7 +2124,6 @@ bool vk_driver_is_turnip(void) {
     }
     return t > 0;
 }
-#endif
 
 void backend_init(void) {
     while (!atomic_load(&ui_ready)) SDL_Delay(1);
@@ -2098,11 +2153,9 @@ void backend_clear_window(void) {
     if (g_vk.dev && vk_frame_begin(black)) vk_frame_end(NULL);
 }
 
-#ifdef __ANDROID__
 void vk_wait_ready(void) {
     while (!atomic_load(&ui_ready)) SDL_Delay(1);
 }
-#endif
 
 int ui_run(void) {
     ui_window_init();

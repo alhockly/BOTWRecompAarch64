@@ -1,0 +1,17 @@
+# Cross compile with clang. The runtime and the generated game code use musttail, which GCC rejects.
+set(CMAKE_SYSTEM_NAME Linux)
+set(CMAKE_SYSTEM_PROCESSOR aarch64)
+set(CMAKE_C_COMPILER clang)
+set(CMAKE_CXX_COMPILER clang++)
+set(CMAKE_C_COMPILER_TARGET aarch64-linux-gnu)
+set(CMAKE_CXX_COMPILER_TARGET aarch64-linux-gnu)
+# No CMAKE_SYSROOT: the aarch64 libc.so linker script uses absolute paths, and a sysroot makes ld look for them twice.
+set(CMAKE_C_COMPILER_WORKS TRUE)
+set(CMAKE_CXX_COMPILER_WORKS TRUE)
+set(CMAKE_CROSSCOMPILING TRUE)
+set(CMAKE_C_FLAGS_INIT "--gcc-toolchain=/usr")
+set(CMAKE_CXX_FLAGS_INIT "--gcc-toolchain=/usr")
+set(CMAKE_FIND_ROOT_PATH /usr/aarch64-linux-gnu)
+set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
+set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
+set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)

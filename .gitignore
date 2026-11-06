@@ -13,6 +13,10 @@ generated-*/
 !/fonts/README.md
 # build output, caches, saves and settings
 build/
+dist/
+linux/aarch64/
+linux/src/
+linux/work/
 /cache/
 save/
 /larecomp.ini
