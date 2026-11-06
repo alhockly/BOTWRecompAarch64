@@ -230,19 +230,25 @@ NVN(nvnQueueSubmitCommands) {
     for (int i = 0; i < n; i++) backend_execute(handles[i]);
 }
 NVN(nvnQueueFlush) { (void)c; }
-#ifdef __ANDROID__
+#if defined(__linux__)
 bool vk_async_on(void);
 void vk_async_drain(void);
 uint64_t vk_async_fence(uint64_t guest_sync);
 void vk_async_wait_id(uint64_t id);
+#ifdef __ANDROID__
 void kernel_blocking_begin(void);
 void kernel_blocking_end(void);
+#endif
 NVN(nvnQueueFinish) {
     (void)c;
+#ifdef __ANDROID__
     kernel_blocking_begin();  // (a long wait: core 0 to the game's other threads, kernel.c)
+#endif
     if (vk_async_on()) vk_async_drain();  // (the render thread's translation first: vulkan/async.c)
     renderer_sync();
+#ifdef __ANDROID__
     kernel_blocking_end();
+#endif
 }
 #else
 NVN(nvnQueueFinish) { (void)c; renderer_sync(); }
@@ -255,13 +261,20 @@ static NvnSync *sync_of(uint64_t guest) {
 }
 uint64_t renderer_fence_seq(void);
 void renderer_wait_seq(uint64_t seq);
+#if defined(__linux__)
 #ifdef __ANDROID__
 static uint64_t g_newest_fence_lseq;  // (sync lag, nvnSyncWait: the render thread's request of the newest fence placed)
+#endif
 NVN(nvnQueueFenceSync) {
     NvnSync *s = sync_of(A(1));
     s->signaled = 1;
-    if (vk_async_on()) s->lseq = g_newest_fence_lseq = vk_async_fence(A(1));  // (its submission: once the render thread gets there)
-    else s->seq = renderer_fence_seq();
+    if (vk_async_on()) {
+#ifdef __ANDROID__
+        s->lseq = g_newest_fence_lseq = vk_async_fence(A(1));  // (its submission: once the render thread gets there)
+#else
+        s->lseq = vk_async_fence(A(1));  // (its submission: once the render thread gets there; sync lag stays off)
+#endif
+    } else s->seq = renderer_fence_seq();
     extern uint64_t renderer_present_count(void);
     s->frame = renderer_present_count();
 }
@@ -283,6 +296,14 @@ NVN(nvnSyncWait) {  // NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED
     if (getenv("LARECOMP_LOG_SYNC") && n++ % 60 == 0) LOG("[nvn] SyncWait #%llu (lr %llx)\n", (unsigned long long)n, c->x[30]);
     static int whole = -1;  // LARECOMP_SYNC_ALL=1: old behaviour, wait for all submitted work
     if (whole < 0) whole = getenv("LARECOMP_SYNC_ALL") ? 1 : 0;
+#if defined(__linux__) && !defined(__ANDROID__)
+    // The render thread translates this fence before the GPU wait. Sync lag (returning the previous frame's fence)
+    // stays off: the game reads GPU results right after this wait.
+    if (vk_async_on()) {
+        if (flush || whole) vk_async_drain();
+        else vk_async_wait_id(sync_of(A(0))->lseq);
+    }
+#endif
 #ifdef __ANDROID__
     uint64_t t0 = plat_now_ns();
     extern void vk_tl(const char *what, uint64_t a, uint64_t b);  // (vulkan/exec.c: LARECOMP_FRAME_TIMELINE)
@@ -763,25 +784,38 @@ enum { RETIRE_FRAMES = 4 };
 typedef struct { NvnTexture *t; uint64_t frame; } RetiredTexture;
 static RetiredTexture *g_retired;
 static int g_nretired, g_cap_retired;
-static void texture_release(NvnTexture *t) {  // g_live_lock; render work drained by the backend
-    if (--t->refs) return;
-    backend_texture_destroyed(t);
+// g_live_lock held. Unlinks a texture whose last reference just dropped. The Vulkan image is destroyed by the
+// caller, after the lock is released: destroying it waits for the render thread, and that wait under this lock
+// deadlocks when the render thread needs the lock (or the thread running the queue is this one).
+static NvnTexture *texture_unlink(NvnTexture *t) {
+    if (--t->refs) return NULL;
     if (t->prev) t->prev->next = t->next;
     else g_all_tex = t->next;
     if (t->next) t->next->prev = t->prev;
     if (t->addr)
         for (NvnTexture **p = &g_desc_hash[desc_hash(t->addr)]; *p; p = &(*p)->hnext)
             if (*p == t) { *p = t->hnext; break; }
-    free(t);
+    return t;
 }
 static void texture_retire(NvnTexture *t) {
     extern uint64_t renderer_present_count(void);
     uint64_t now = renderer_present_count();
+    NvnTexture **dead = NULL;
+    int ndead = 0, cap_dead_tex = 0;
     pthread_mutex_lock(&g_live_lock);
     int k = 0;
     for (int i = 0; i < g_nretired; i++) {
         if (g_retired[i].frame + RETIRE_FRAMES <= now) {
-            texture_release(g_retired[i].t);
+            NvnTexture *d = texture_unlink(g_retired[i].t);
+            if (d) {
+                if (ndead == cap_dead_tex) {
+                    cap_dead_tex = cap_dead_tex ? cap_dead_tex * 2 : 8;
+                    NvnTexture **grown = realloc(dead, (size_t)cap_dead_tex * sizeof *dead);
+                    if (!grown) FATAL("nvn: out of memory retiring textures\n");
+                    dead = grown;
+                }
+                dead[ndead++] = d;
+            }
         } else {
             g_retired[k++] = g_retired[i];
         }
@@ -795,6 +829,11 @@ static void texture_retire(NvnTexture *t) {
     g_retired[g_nretired].t = t, g_retired[g_nretired].frame = now;
     g_nretired++;
     pthread_mutex_unlock(&g_live_lock);
+    for (int i = 0; i < ndead; i++) {  // (waits for queued draws, then the image: not under g_live_lock)
+        backend_texture_destroyed(dead[i]);
+        free(dead[i]);
+    }
+    free(dead);
 }
 static void texture_drop_owner(NvnTexture *t) {
     pthread_mutex_lock(&g_live_lock);
@@ -1185,7 +1224,7 @@ NVN(nvnTexturePoolInitialize) {
 NVN(nvnTexturePoolFinalize) {
     NvnDescPool *d = HOST(NvnDescPool, A(0));
     if (!d) return;
-#ifdef __ANDROID__
+#if defined(__linux__)
     vk_async_drain();
 #endif
     NvnTexEntry *entries = d->entries;
@@ -1211,7 +1250,7 @@ static void register_texture(Cpu *c) {
     g_tex_stat_reg++;
     NvnTexEntry *e = &((NvnTexEntry *)d->entries)[id];
     NvnTexture *old = e->tex, *t = HOST(NvnTexture, A(2));
-#ifdef __ANDROID__
+#if defined(__linux__)
     // An asynchronous draw must finish reading the previous descriptor before its slot is replaced.
     if (old) {
         extern uint64_t g_tex_drain_ns, g_tex_drains;  // (LARECOMP_LOG_TEXDIAG: the game's threads' wait in these)
@@ -1267,7 +1306,7 @@ static void register_sampler(NvnSamplerDesc *e, const NvnSamplerDesc *n) {
     NvnSamplerDesc o = *e;
     o.backend = NULL;
     if (!memcmp(&o, &v, sizeof v)) return;
-#ifdef __ANDROID__
+#if defined(__linux__)
     static int off = -1;
     if (off < 0) off = getenv("LARECOMP_NO_SMP_DRAIN") != NULL;
     if (!off) vk_async_drain();

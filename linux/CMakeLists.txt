@@ -71,7 +71,10 @@ endif()
 target_link_libraries(botwrecomp PRIVATE
     ${DEPS}/lib/libSDL3.so ${SHADERC_LIB} ${VULKAN_LIB} pthread dl m)
 if(HAVE_FFMPEG)
+    # The cross link only needs the SONAMEs. Fedora's libavcodec pulls in codec plugins
+    # that are not in this sysroot; the handheld's own FFmpeg provides them at run time.
     target_link_libraries(botwrecomp PRIVATE
         ${DEPS}/lib/libavformat.so ${DEPS}/lib/libavcodec.so ${DEPS}/lib/libavutil.so ${DEPS}/lib/libswscale.so)
+    target_link_options(botwrecomp PRIVATE -Wl,--allow-shlib-undefined)
 endif()
 target_link_options(botwrecomp PRIVATE -rdynamic -Wl,-z,nostart-stop-gc -Wl,-rpath,${DEPS}/lib)

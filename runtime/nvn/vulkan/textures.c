@@ -707,7 +707,7 @@ static void texture_snapshot_forget(TexBackend *b);
 void backend_texture_destroyed(NvnTexture *t) {
     TexBackend *b = t->backend;
     if (!b) return;
-#ifdef __ANDROID__
+#if defined(__linux__)
     extern void vk_async_drain(void);
     vk_async_drain();  // (the render thread idle: vulkan/async.c)
 #endif
@@ -1134,7 +1134,7 @@ void backend_pool_written(uint64_t addr, uint64_t size) { (void)addr; (void)size
 
 // Host-produced texel data (decoded video, any thread): applied on the render thread at the texture's next use.
 void renderer_upload_rgba(NvnTexture *t, const void *rgba, uint32_t w, uint32_t h, uint32_t stride) {
-#ifdef __ANDROID__
+#if defined(__linux__)
     extern void vk_async_drain(void);
     vk_async_drain();  // (the render thread idle: vulkan/async.c)
 #endif

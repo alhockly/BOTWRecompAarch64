@@ -2,6 +2,7 @@
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
@@ -24,6 +25,15 @@
 VkG g_vk;
 static SDL_Window *window;
 static atomic_bool ui_ready;
+#if !defined(__ANDROID__)
+static Uint32 g_async_wake;
+void vk_async_wake_window(void) {
+    if (!g_async_wake) return;
+    SDL_Event e = {0};
+    e.type = g_async_wake;
+    SDL_PushEvent(&e);
+}
+#endif
 static VkDebugUtilsMessengerEXT messenger;
 
 // Diagnostic byte search helper used on request (e.g. LARECOMP_FIND_HEX).
@@ -1461,7 +1471,7 @@ uint64_t renderer_present_count(void);
 void renderer_save_texture_tex(TexBackend *b, const char *path);
 
 static uint64_t frames, total_frames, g_frame_counter;
-#ifdef __ANDROID__
+#if defined(__linux__)
 // LARECOMP_VK_ASYNC (vulkan/async.c): the game's threads count the presents they queued, the render thread the ones
 // it ran - each side's "this frame" stays its own
 static uint64_t g_game_frames;
@@ -1489,7 +1499,7 @@ static NvnTexture *g_last_presented;
 const float *vk_shot_crop(void) { return g_shot_crop; }
 
 void backend_present(NvnTexture *t);
-#ifdef __ANDROID__
+#if defined(__linux__)
 // The game's half of a present: pacing, input, tests - on the game's thread (its frame: renderer_present_count)
 static void present_game_half(void) {
     extern void vk_pace_frame(void);
@@ -1523,9 +1533,13 @@ void backend_represent(void) {
     else SDL_Delay(16);
 }
 
-#ifdef __ANDROID__
+#if defined(__linux__)
 void vk_present_now(NvnTexture *t, uint64_t asked) {  // (the window's half of backend_present; asked: when the game's
+#ifdef __ANDROID__
     present_asked = asked;                              // thread handed it over)
+#else
+    (void)asked;
+#endif
 #else
 void backend_present(NvnTexture *t) {
 #endif
@@ -1610,8 +1624,10 @@ void backend_present(NvnTexture *t) {
     frames++;
     total_frames++;
     g_frame_counter++;
+#if defined(__linux__)
 #ifdef __ANDROID__
     vk_timing_trace_frame(total_frames);
+#endif
     if (!vk_async_on()) present_game_half();  // (same place as before; LARECOMP_VK_ASYNC: on the game's thread)
 #else
     extern void vk_pace_frame(void);
@@ -2134,7 +2150,7 @@ void backend_init(void) {
 // ---- in-place reboot (runtime/main.c teardown; main thread, guest threads stopped)
 void backend_reset(void) {
     if (!g_vk.dev) return;
-#ifdef __ANDROID__
+#if defined(__linux__)
     vk_async_drain();
 #endif
     vkDeviceWaitIdle(g_vk.dev);
@@ -2147,7 +2163,7 @@ void backend_reset(void) {
 void backend_guest_memory_reset(void) {}  // (exec.c re-imports the heap on first use)
 void backend_clear_window(void) {
     static const float black[4] = {0, 0, 0, 1};
-#ifdef __ANDROID__
+#if defined(__linux__)
     vk_async_drain();
 #endif
     if (g_vk.dev && vk_frame_begin(black)) vk_frame_end(NULL);
@@ -2159,9 +2175,19 @@ void vk_wait_ready(void) {
 
 int ui_run(void) {
     ui_window_init();
+#if !defined(__ANDROID__)
+    extern void vk_async_bind_service_thread(void);
+    extern void vk_async_service(void);
+    extern bool vk_async_pending(void);
+    g_async_wake = SDL_RegisterEvents(1);
+    vk_async_bind_service_thread();  // (before ui_ready: the game queues lists only after that, and this thread runs them)
+#endif
     atomic_store(&ui_ready, true);
     for (;;) {
         if (rt_reboot_requested()) return rt_reboot_requested();  // (runtime/main.c tears the game down)
+#if !defined(__ANDROID__)
+        vk_async_service();  // (one frame of translation and present, on this thread)
+#endif
         SDL_Event e;
 #ifdef __ANDROID__
         // (SDL's wait doesn't sleep on Android: it kept a core busy updating joysticks and reading the clock - 40% of
@@ -2171,7 +2197,10 @@ int ui_run(void) {
         polled = true;
         while (SDL_PollEvent(&e)) {
 #else
-        while (SDL_WaitEventTimeout(&e, 16)) {
+        int wait_ms = vk_async_pending() ? 0 : 16;
+        while (SDL_WaitEventTimeout(&e, wait_ms)) {
+            if (e.type == g_async_wake) { wait_ms = 0; continue; }
+            wait_ms = 0;
 #endif
 #ifdef __ANDROID__
             if (e.type == SDL_EVENT_WILL_ENTER_BACKGROUND && g_vk.dev) vk_pipeline_cache_save();  // (may not come back)

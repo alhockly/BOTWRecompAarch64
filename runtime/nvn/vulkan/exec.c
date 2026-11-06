@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 #ifdef __ANDROID__
 #include <sys/mman.h>
@@ -62,8 +63,8 @@ void vk_collect_dead(void);
 
 // ================================================================== submissions
 // A submission = optional upload command buffer + the main one, signalling the timeline with its number.
-#ifdef __ANDROID__
-#define SUBS 16  // (LARECOMP_VK_ASYNC submits a frame in chunks: more submissions in flight)
+#if defined(__linux__)
+#define SUBS 16  // (the render thread submits a frame in chunks: more submissions in flight)
 #else
 #define SUBS 8
 #endif
@@ -79,7 +80,7 @@ static Sub subs[SUBS];
 static int cur_sub;
 static void ss_forget(void);
 static uint64_t submit_seq;  // last submitted
-#ifdef __ANDROID__
+#if defined(__linux__)
 // The last submission with the game's commands in it (backend_execute's), and whether some are not submitted yet.
 // The game's fences (nvnQueueFenceSync) right after its submission went to the next one - the window's present,
 // which waits for a window image: its waits followed the compositor (SyncWait 8-17 ms a frame) rather than its own
@@ -150,13 +151,14 @@ void vk_wait_seq(uint64_t seq) {
     if (vk_timing_trace_on()) vk_timing_trace_wait(VK_TIMING_TIMELINE, SDL_GetTicksNS() - t0);
 #endif
     if (r == VK_TIMEOUT) LOG("[vk] GPU did not finish submission %llu within 10 s (device lost?)\n", (unsigned long long)seq);
-    else if (r == VK_SUCCESS) cq_resolve_done(seq);  // (the game reads its timing counters after waiting)
+    else if (r == VK_SUCCESS) {
+        cq_resolve_done(seq);  // (the game reads its timing counters after waiting)
 #ifdef __ANDROID__
-    if (r == VK_SUCCESS) gcopy_retire(seq);
+        gcopy_retire(seq);
 #elif defined(__linux__)
-    if (r == VK_SUCCESS) linux_gcopy_retire(seq);
+        linux_gcopy_retire(seq);
 #endif
-    else {
+    } else {
         extern void vk_devlost_dump(void);
         vk_devlost_dump();
         vk_device_fault_report();
@@ -875,7 +877,7 @@ void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra
     }
     pthread_mutex_lock(&seq_lock);
     submit_seq++;
-#ifdef __ANDROID__
+#if defined(__linux__)
     last_submit_ns = SDL_GetTicksNS();
     if (game_pending) work_seq = submit_seq;  // (cleared when backend_execute is done: flushes inside it come first)
 #endif
@@ -911,15 +913,22 @@ void renderer_sync(void) {
 uint64_t renderer_fence_seq(void) {
     pthread_mutex_lock(&seq_lock);
     uint64_t q = submit_seq + (subs[cur_sub].main_begun || subs[cur_sub].upload_begun ? 1 : 0);
-#ifdef __ANDROID__
+#if defined(__linux__)
     static int fence_present = -1;
     if (fence_present < 0) fence_present = getenv("LARECOMP_FENCE_PRESENT") != NULL;
     if (!game_pending && work_seq && !fence_present) q = work_seq;
     static int log = -1;
     if (log < 0) log = getenv("LARECOMP_LOG_SYNCSEQ") != NULL;
-    if (log) LOG("[syncseq] t %.2f fence -> seq %llu (submitted %llu, work %llu, begun %d/%d, tid %d)\n", SDL_GetTicksNS() / 1e6,
-                 (unsigned long long)q, (unsigned long long)submit_seq, (unsigned long long)work_seq, subs[cur_sub].main_begun,
-                 subs[cur_sub].upload_begun, (int)pthread_gettid_np(pthread_self()));
+    if (log) {
+#ifdef __ANDROID__
+        int tid = (int)pthread_gettid_np(pthread_self());
+#else
+        int tid = (int)syscall(SYS_gettid);
+#endif
+        LOG("[syncseq] t %.2f fence -> seq %llu (submitted %llu, work %llu, begun %d/%d, tid %d)\n", SDL_GetTicksNS() / 1e6,
+            (unsigned long long)q, (unsigned long long)submit_seq, (unsigned long long)work_seq, subs[cur_sub].main_begun,
+            subs[cur_sub].upload_begun, tid);
+    }
 #endif
     pthread_mutex_unlock(&seq_lock);
     return q;
@@ -1928,7 +1937,7 @@ static void begin_pass(void) {
                 st.viewport[0][3], st.rt.color[0]->width, st.rt.color[0]->height);
         last_w = st.viewport[0][2], last_h = st.viewport[0][3];
     }
-#ifdef __ANDROID__
+#if defined(__linux__)
     {   // LARECOMP_VK_ASYNC: the GPU starts on a frame while the render thread still translates the rest of it - a
         // submission at a pass boundary (no pass split: on a tiler that would store and reload its tiles) once
         // LARECOMP_VK_CHUNK_US of translation has gone by. Translating a whole frame and then running it on the GPU
@@ -3551,8 +3560,10 @@ static void resolve_feedback(Prog *pr, uint32_t draw_written) {
                     bool inplace = getenv("LARECOMP_FEEDBACK_INPLACE") || (vk_driver_is_turnip() && vk_turnip_path_on(g_settings.inplace_reads));
                     const char *how = g_settings.inplace_reads < 0 ? "automatic" : "settings";
 #else
+                    // Copies on this Adreno 650. In place (checked frame by frame on an Adreno 830 only) left the
+                    // UI's item draws blank. LARECOMP_FEEDBACK_INPLACE=1: in place, on any driver.
                     bool inplace = getenv("LARECOMP_FEEDBACK_INPLACE") != NULL;
-                    const char *how = "off";
+                    const char *how = inplace ? "env" : "off";
 #endif
                     g_inplace_copy = getenv("LARECOMP_FEEDBACK_COPY") != NULL || !inplace;
                     LOG("[vk] targets a draw writes, sampled by it: %s (%s)\n", g_inplace_copy ? "copies" : "in place", how);
@@ -8141,7 +8152,7 @@ int vk_ab(const char *what) {
 }
 
 static void split_long_pass(void) {
-#ifdef __ANDROID__
+#if defined(__linux__)
     static long split = -1;
     if (split < 0) {  // (3 ms by default; not on Qualcomm's driver, as LARECOMP_VK_CHUNK_US)
         extern bool vk_driver_is_qualcomm(void);
@@ -8465,7 +8476,7 @@ static void exec_list(uint64_t handle, int depth) {
     }
 }
 
-#ifdef __ANDROID__
+#if defined(__linux__)
 // LARECOMP_VK_ASYNC=1: queued for the render thread (vulkan/async.c), which runs vk_execute_now
 bool vk_async_on(void);
 void vk_async_execute(uint64_t handle);
@@ -8479,7 +8490,7 @@ void vk_execute_now(uint64_t handle) {
 void backend_execute(uint64_t handle) {
 #endif
     PROF_T0();
-#ifdef __ANDROID__
+#if defined(__linux__)
     game_pending = true;  // (renderer_fence_seq)
 #endif
     static int log_lists = -1;  // LARECOMP_LOG_LISTS=1: the command lists of one frame in 120 (draws, passes, time)
@@ -8496,7 +8507,7 @@ void backend_execute(uint64_t handle) {
     if (sync_submit < 0) sync_submit = getenv("LARECOMP_SYNC_SUBMIT") ? 1 : 0;
     if (sync_submit) renderer_flush();
     else renderer_submit();
-#ifdef __ANDROID__
+#if defined(__linux__)
     game_pending = false;
 #endif
 }

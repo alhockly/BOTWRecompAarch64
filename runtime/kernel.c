@@ -523,8 +523,8 @@ static uint32_t block_current(int64_t timeout_ns) {
     struct timespec ts;
     if (timeout_ns >= 0) deadline(&ts, timeout_ns);
     waitlist_add(t);
-#ifdef __ANDROID__
     int kind0 = t->wait_kind;
+#ifdef __ANDROID__
     {   // LARECOMP_KWAIT_SPIN_US=<us>: a short wait first without sleeping (the kernel lock let go meanwhile) - the
         // main thread hands work to its job workers and waits for their results many times a frame, each wake-up a
         // futex and maybe a sleeping core brought back. A/B in one run (LARECOMP_AB=<n>:kspin), 1.9.0 with FSR 1 +
@@ -556,7 +556,6 @@ static uint32_t block_current(int64_t timeout_ns) {
             break;
         }
         if (!kwait(timeout_ns, &ts)) {
-#ifdef __ANDROID__
             // the wait ended while the timeout fired: a waker got there first (woken: wait_kind is NONE and the
             // loop ends with its result - a condition variable's thread may own the mutex by now) or moved it on
             // (a condition variable's thread signalled, now waiting for its mutex: no timeout for that part)
@@ -564,7 +563,6 @@ static uint32_t block_current(int64_t timeout_ns) {
                 timeout_ns = -1;
                 continue;
             }
-#endif
             t->wait_kind = WAIT_NONE;
             t->wait_result = R_TIMEOUT;
             break;
@@ -600,11 +598,9 @@ static uint32_t svc_arbitrate_unlock(uint64_t addr) {
 static uint32_t svc_wait_process_wide_key(uint64_t mutex, uint64_t key, uint32_t tag, int64_t timeout) {
     pthread_mutex_lock(&g_klock);
     KThread *t = t_cur;
-#ifdef __ANDROID__
     // the key says "waiters" before the mutex goes: once it's released, a thread that takes it, changes the state
     // and checks the key must see this waiter (else it skips the signal and the wakeup is lost)
     __atomic_store_n(u32p(key), 1, __ATOMIC_SEQ_CST);
-#endif
     mutex_release(mutex);
     t->wait_kind = WAIT_CONDVAR;
     t->wait_addr = key;

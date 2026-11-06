@@ -1,12 +1,11 @@
-# BOTWRecompAndroid
+# BOTWRecompAarch64
 
-**English** | [Português](README.pt-BR.md)
 
-[![Listed on PlayPorted](https://playported.com/badge.svg)](https://playported.com/ports/754-the-legend-of-zelda-breath-of-the-wild/)
-
-A port of *The Legend of Zelda: Breath of the Wild* (Nintendo Switch, versions **1.0.0, 1.6.0, 1.8.2 and 1.9.0**) for
-Android. This is **not Switch emulation**: the game code can be recompiled into C for the phone or, in the experimental
+A port of *The Legend of Zelda: Breath of the Wild* (Nintendo Switch, versions **1.0.0, 1.6.0, 1.8.2 and 1.9.0**) for ARM64
+Linux handhelds!!! . This is **not Switch emulation**: the game code can be recompiled into C for the phone or, in the experimental
 Native Mode, run directly on its ARM64 CPU. The game's graphics API (NVN) is translated to Vulkan.
+
+Forked from the Android port of BOTW **[BOTWRecompAndroid](https://github.com/mamcjr/BOTWRecompAndroid)** and 
 
 It is built on the engine of **[LAS Recomp](https://github.com/peiikai/LASRecomp)** by peiikai (a recompilation of
 *Link's Awakening*) and its Android port, **[LASRecompAndroid](https://github.com/mamcjr/LASRecompAndroid)**.
@@ -19,8 +18,8 @@ It is built on the engine of **[LAS Recomp](https://github.com/peiikai/LASRecomp
 
 ## Supported platform
 
-Android is the only application target. Desktop ports and packaging were discontinued on 2026-10-22.
-Windows, Linux or macOS may still be used as development hosts with the Android SDK/NDK.
+Aarch64 Linux is the only application target. Desktop ports and packaging were discontinued on 2026-10-22.
+
 
 ## Status
 
@@ -30,8 +29,7 @@ Windows, Linux or macOS may still be used as development hosts with the Android 
 - **Game code:** choose Recompiled Mode (build the code once on the phone) or experimental Native Mode (skip that
   build). You can switch a Recompiled setup to Native Mode later.
 - **Game files:** copy the extracted files into app storage or, since **0.2.3-beta**, use them in place without an
-  additional copy of about 16 GB. In-place use requires Android all-files access and the source folder must remain
-  available.
+  additional copy of about 16 GB.
 - **DLC, saves and mods:** install your own extracted Expansion Pass data; import and export saves as ZIP or import an
   emulator save folder; use mods, including mods that add files and DLC mod folders. In-place mod use needs more testing.
 - **Video and controls:** optional 60 fps on supported game versions and experimental 60 fps in-engine cutscenes,
@@ -81,43 +79,10 @@ icons read from your game files. The game's menus keep the classic buttons.
 
 ![Rune fan](docs/images/touch-controls-overhaul-runes.jpg)
 
-## Installing (beta)
 
-1. Download the APK from [Releases](https://github.com/mamcjr/BOTWRecompAndroid/releases) and install it (Android 11+,
-   ARM64 and Vulkan). You need your own extracted game folder containing `exefs` and `romfs`.
-2. In **Game Files**, choose **Game code**: **Native (experimental)** skips the on-phone code build; **Recompiled**
-   builds it once. Under **Game files**, choose **Copy them** or **Use them in place**, then select the extracted folder.
-   In-place use asks for Android all-files access; keep that folder where it is. Copying needs roughly 16 GB more
-   storage for the game data, while Recompiled Mode also needs space for generated code.
-3. If you own the Expansion Pass, install its extracted DLC `romfs` through **Settings > DLC > Install DLC**. To bring
-   over saves, use **Settings > Saves** to import a ZIP or emulator save folder.
-4. On Adreno phones, a Mesa Turnip driver can perform better than the system driver. Select it under **Settings >
-   Files > Vulkan driver**. If the app reports that the Vulkan driver is too old at startup, long-press the app icon
-   and choose **Choose driver** before launching the game.
 
-Updating from 0.2.x to 0.3.1-beta does not require rebuilding game code. Shaders compile again once, so the first
-minutes may stutter. To report a problem, open an [issue](https://github.com/mamcjr/BOTWRecompAndroid/issues) with
-your phone, GPU, driver, game version and a log from **Settings > Files > Save a log file**.
 
-## Testing on Android (developers)
 
-With the Android SDK / NDK, a phone on adb and your dump in `Dump/`:
-
-```bash
-cd android/botwrecompandroid && ./gradlew assembleDebug    # the app
-android/build_gamelib.sh Dump/01007EF00011E000/exefs  # the game code (about an hour)
-android/push_game.sh Dump/01007EF00011E000           # game files and game code onto the phone
-android/run_boot.sh 120                               # start the game, log to android/out/boot.log
-```
-
-## Support the project
-
-BOTWRecompAndroid is a free, independent project. If you enjoy it and would like to support its development, you can
-sponsor me on GitHub. Your support helps me dedicate time to fixing bugs, improving performance and compatibility, and
-working on future releases. Sponsorship is entirely optional: it does not unlock features or guarantee specific fixes.
-Bug reports, device tests, and contributions are also greatly appreciated.
-
-[![Sponsor on GitHub](https://img.shields.io/badge/Sponsor-on%20GitHub-EA4AAA?logo=githubsponsors&logoColor=white)](https://github.com/sponsors/mamcjr)
 
 ## Credits
 
