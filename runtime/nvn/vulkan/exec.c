@@ -4,6 +4,7 @@
 #include <ctype.h>
 #include <float.h>
 #include <math.h>
+#include <stdio.h>
 #include <stdarg.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -1929,13 +1930,21 @@ static void begin_pass(void) {
     vk_end_pass();
     if (st.rt.depth && st.rt.ncolor >= 3 && st.rt.color[0] && vk_texture_scale_group(st.rt.color[0]) == RS_SCENE) {
         g_scene_frame = renderer_present_count();
-        static float last_w, last_h;  // (LARECOMP_LOG_SCENE=1: the game's dynamic resolution, the G-buffer's size)
+        static float last_w, last_h;  // (LARECOMP_LOG_SCENE=1 or LARECOMP_VK_PROF=1: guest size and the GPU image)
+        static uint32_t last_gw, last_gh;
         static int log_scene = -1;
-        if (log_scene < 0) log_scene = getenv("LARECOMP_LOG_SCENE") != NULL;
-        if (log_scene && (st.viewport[0][2] != last_w || st.viewport[0][3] != last_h))
-            LOG("[scene] frame %llu: viewport %.0f x %.0f of %u x %u\n", (unsigned long long)g_scene_frame, st.viewport[0][2],
-                st.viewport[0][3], st.rt.color[0]->width, st.rt.color[0]->height);
-        last_w = st.viewport[0][2], last_h = st.viewport[0][3];
+        if (log_scene < 0) log_scene = getenv("LARECOMP_LOG_SCENE") || getenv("LARECOMP_VK_PROF");
+        TexBackend *tb = (TexBackend *)st.rt.color[0]->backend;
+        uint32_t gw = tb ? tb->width : 0, gh = tb ? tb->height : 0;
+        // Guest width stays 1600x900. The image the GPU draws is that size times the scene scale (textures.c).
+        if (log_scene && (st.viewport[0][2] != last_w || st.viewport[0][3] != last_h || gw != last_gw || gh != last_gh)) {
+            float ssx = 1, ssy = 1;
+            renderer_get_scene_scale(&ssx, &ssy);
+            LOG("[scene] frame %llu res %d scale %.3f x %.3f viewport %.0f x %.0f guest %u x %u gpu %u x %u\n",
+                (unsigned long long)g_scene_frame, g_settings.res_mode, ssx, ssy, st.viewport[0][2], st.viewport[0][3],
+                st.rt.color[0]->width, st.rt.color[0]->height, gw, gh);
+        }
+        last_w = st.viewport[0][2], last_h = st.viewport[0][3], last_gw = gw, last_gh = gh;
     }
 #if defined(__linux__)
     {   // LARECOMP_VK_ASYNC: the GPU starts on a frame while the render thread still translates the rest of it - a
@@ -4235,39 +4244,63 @@ static bool gmem_import(uint64_t size) {
 
 static uint64_t gmem_tried;  // heap size the import was last attempted for (gmem_info imports / re-imports)
 
-#ifdef __linux__
+#if defined(__linux__) && !defined(__ANDROID__)
 // Turnip only: map the guest heap at HEAP_BASE with VK_EXT_map_memory_placed. No memfd and no settings. On success the
 // draw path binds this buffer (guest_direct) and glyph loads use the storage window. On failure the CPU copies stay.
+static unsigned long meminfo_kb(const char *key) {
+    FILE *mf = fopen("/proc/meminfo", "r");
+    if (!mf) return 0;
+    char line[128];
+    unsigned long v = 0;
+    size_t n = strlen(key);
+    while (fgets(line, sizeof line, mf)) {
+        if (strncmp(line, key, n) == 0 && line[n] == ':') {
+            sscanf(line + n + 1, "%lu", &v);
+            break;
+        }
+    }
+    fclose(mf);
+    return v;
+}
+
 bool vk_heap_place(uint64_t size) {
     extern bool vk_driver_is_turnip(void);
     if (!size || !g_vk.map_placed || !vk_driver_is_turnip() || getenv("LARECOMP_VK_NO_PLACED")) {
-        if (gcopy_linux) plat_write_tracking_enable(HEAP_BASE, HEAP_BASE + HEAP_MAX);
+        plat_write_tracking_enable(HEAP_BASE, HEAP_BASE + HEAP_MAX);
         return false;
     }
     vk_wait_ready();
     if (gmem_buf) return true;
-    FILE *mf = fopen("/proc/meminfo", "r");
-    unsigned long mem_kb = 0;
-    if (mf) { fscanf(mf, "MemTotal: %lu", &mem_kb); fclose(mf); }
-    if (mem_kb && mem_kb < 7ul * 1024 * 1024 && !getenv("LARECOMP_HEAP_ANY_RAM")) {
-        LOG("[vk] %lu MB of RAM: the guest heap stays copied (LARECOMP_HEAP_ANY_RAM=1 places it anyway)\n", mem_kb / 1024);
-        if (gcopy_linux) plat_write_tracking_enable(HEAP_BASE, HEAP_BASE + HEAP_MAX);
-        return false;
-    }
     uint64_t align = g_vk.placed_align > 65536 ? g_vk.placed_align : 65536;
     size = (size + align - 1) & ~(align - 1);
     if ((HEAP_BASE & (align - 1)) || size > HEAP_MAX) {
         LOG("[vk] guest heap cannot be placed (alignment %llu, size %llu MB)\n",
             (unsigned long long)align, (unsigned long long)(size >> 20));
-        if (gcopy_linux) plat_write_tracking_enable(HEAP_BASE, HEAP_BASE + HEAP_MAX);
+        plat_write_tracking_enable(HEAP_BASE, HEAP_BASE + HEAP_MAX);
         return false;
     }
+    // The placed heap is committed at once. MemTotal on an 8 GB handheld is just over 7 GiB, which used to pass,
+    // while Steam and gamescope were already resident. Place it only when MemAvailable covers the heap and about
+    // 2 GiB for the session. LARECOMP_HEAP_ANY_RAM=1 places it anyway.
+    unsigned long avail_kb = meminfo_kb("MemAvailable");
+    unsigned long heap_kb = (unsigned long)((size + 1023) >> 10);
+    unsigned long need_kb = heap_kb + 2ul * 1024 * 1024;
+    bool force_place = getenv("LARECOMP_HEAP_ANY_RAM") != NULL;
+    if (!force_place && (!avail_kb || avail_kb < need_kb)) {
+        LOG("[vk] %lu MB available, guest heap %llu MB: stays copied (needs the heap plus 2048 MB; "
+            "LARECOMP_HEAP_ANY_RAM=1 places it anyway)\n",
+            avail_kb / 1024, (unsigned long long)(size >> 20));
+        plat_write_tracking_enable(HEAP_BASE, HEAP_BASE + HEAP_MAX);
+        return false;
+    }
+    LOG("[vk] %lu MB available, placing guest heap %llu MB%s\n", avail_kb / 1024, (unsigned long long)(size >> 20),
+        force_place ? " (LARECOMP_HEAP_ANY_RAM=1)" : "");
     VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = size,
         .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
                  VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT};
     VkBuffer buf = VK_NULL_HANDLE;
     if (vkCreateBuffer(g_vk.dev, &bi, NULL, &buf) != VK_SUCCESS) {
-        if (gcopy_linux) plat_write_tracking_enable(HEAP_BASE, HEAP_BASE + HEAP_MAX);
+        plat_write_tracking_enable(HEAP_BASE, HEAP_BASE + HEAP_MAX);
         return false;
     }
     VkMemoryRequirements mr;
@@ -4293,7 +4326,7 @@ bool vk_heap_place(uint64_t size) {
         LOG("[vk] guest heap placement failed (%d); shader global memory through CPU copies\n", (int)r);
         if (mem) vkFreeMemory(g_vk.dev, mem, NULL);
         vkDestroyBuffer(g_vk.dev, buf, NULL);
-        if (gcopy_linux) plat_write_tracking_enable(HEAP_BASE, HEAP_BASE + HEAP_MAX);
+        plat_write_tracking_enable(HEAP_BASE, HEAP_BASE + HEAP_MAX);
         return false;
     }
     VkMemoryMapPlacedInfoEXT pl = {.sType = VK_STRUCTURE_TYPE_MEMORY_MAP_PLACED_INFO_EXT, .pPlacedAddress = (void *)(uintptr_t)HEAP_BASE};
@@ -4307,7 +4340,7 @@ bool vk_heap_place(uint64_t size) {
         if (mem) vkFreeMemory(g_vk.dev, mem, NULL);  // freeing a placed map unmaps it
         if (mapped == (void *)(uintptr_t)HEAP_BASE) plat_reset_guest(HEAP_BASE, HEAP_BASE + size);
         vkDestroyBuffer(g_vk.dev, buf, NULL);
-        if (gcopy_linux) plat_write_tracking_enable(HEAP_BASE, HEAP_BASE + HEAP_MAX);
+        plat_write_tracking_enable(HEAP_BASE, HEAP_BASE + HEAP_MAX);
         return false;
     }
     gmem_buf = buf;
@@ -4315,6 +4348,7 @@ bool vk_heap_place(uint64_t size) {
     gmem_size = size;
     gcopy_linux = false;
     gwin_mode = size > g_vk.props.limits.maxStorageBufferRange && !getenv("LARECOMP_VK_NO_GWIN");
+    plat_nohugepage(HEAP_BASE, size);  // the placed map replaced the anonymous pages, so the startup prctl does not cover it
     LOG("[vk] guest heap %llu MB is GPU memory (placed at 0x%llx, align %llu)%s\n", (unsigned long long)(size >> 20),
         (unsigned long long)HEAP_BASE, (unsigned long long)align,
         gwin_mode ? "; draws reach global memory through windows" : "");
@@ -5585,7 +5619,8 @@ static bool pt_init(void) {
     if (pt_state >= 0) return pt_state;
     uint64_t pg = VC_PAGE, one;
     int n = plat_written_pages(HEAP_BASE, VC_PAGE, &one, 1, &pg);  // (is there write tracking?)
-    pt_state = n >= 0 && pg == VC_PAGE;
+    if (n < 0) return false;  // not enabled yet: SetHeapSize may turn it on after the first probe
+    pt_state = pg == VC_PAGE;
     if (!pt_state) { LOG("[vk] no page write tracking (%d, page %llu)\n", n, (unsigned long long)pg); return false; }
     vc_page_gen = calloc(HEAP_MAX / VC_PAGE, sizeof *vc_page_gen);
     vc_page_gpu = calloc(HEAP_MAX / VC_PAGE, 1);
@@ -5650,14 +5685,17 @@ static void vc_mark_sbufs(int stage) {
 static bool vcache_lookup(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSize *off) {
     if (vc_on < 0) {
         const char *e = getenv("LARECOMP_VK_VCACHE");
-        vc_on = !e || atoi(e) != 0;
-        if (vc_on && !pt_init()) {
-            LOG("[vk] vertex cache off: no page write tracking\n");
-            vc_on = 0;
+        if (e && atoi(e) == 0) vc_on = 0;
+        else if (pt_init()) vc_on = 1;
+        else {
+            static int logged;
+            if (!logged) LOG("[vk] vertex cache waiting: no page write tracking yet\n"), logged = 1;
         }
     }
-#ifdef __ANDROID__
+#if defined(__ANDROID__)
     bool cpu_fill = !gmem_buf && gcopy_mode;  // (Qualcomm's driver: filled from the CPU - vc_flush)
+#elif defined(__linux__)
+    bool cpu_fill = !gmem_buf && gcopy_linux;  // (heap not placed: same CPU fill, refreshed from written pages)
 #else
     bool cpu_fill = false;
 #endif
@@ -5777,8 +5815,10 @@ static bool guest_direct(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSi
     static int copy = -1;
     if (copy < 0) copy = getenv("LARECOMP_VK_COPY_VERTICES") != NULL;
     if (copy || addr < HEAP_BASE) return false;
-#ifdef __ANDROID__
+#if defined(__ANDROID__)
     if (gcopy_mode && !gmem_buf) return addr + size <= HEAP_BASE + HEAP_MAX && vcache_lookup(addr, size, buf, off);  // (else copied)
+#elif defined(__linux__)
+    if (gcopy_linux && !gmem_buf) return addr + size <= HEAP_BASE + HEAP_MAX && vcache_lookup(addr, size, buf, off);
 #endif
     if (addr + size > HEAP_BASE + gmem_size && kernel_heap_size() != gmem_tried) { gmem_tried = kernel_heap_size(); gmem_info(); }
     if (!gmem_buf || addr + size > HEAP_BASE + gmem_size) return false;

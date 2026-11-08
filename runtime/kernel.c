@@ -1008,7 +1008,7 @@ static void svc_impl(Cpu *c, uint32_t imm, uint64_t pc) {
             // took ~30 us - each look at the job queue came that much later (TOTKRecompAndroid, 2026-10-31: +6% fps,
             // +14% with core 0's too, whose yield still hands the core on: its queue, svc_blocks).
             // LARECOMP_HOST_YIELD=1: the host's yield as before; =2: skipped off core 0 only. LARECOMP_AB=<n>:yield.
-#ifdef __ANDROID__
+#if defined(__linux__)
             static int host_yield = -1;
             if (host_yield < 0) host_yield = getenv("LARECOMP_HOST_YIELD") ? atoi(getenv("LARECOMP_HOST_YIELD")) : 0;
             extern int vk_ab(const char *what);

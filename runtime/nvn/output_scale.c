@@ -7,7 +7,7 @@
 // final image's (else the window's):
 //   Match display  the scene at the size it takes in the final image
 //   1x .. 4x       N times the Switch's docked scene: 900 lines x N; capped to the GPU's 16384-pixel texture limit
-//   .75x / .50x / .25x  of Match display
+//   25% .. 95%     of Match display, in steps of 5
 //   Dynamic        Match display, lowered in steps while the GPU can't hold the frame rate and raised again when it
 //                  can (each change reallocates the render targets: a short hitch, so it changes rarely, with hysteresis)
 // Test overrides: LARECOMP_SCALE=<f> (the scene's height = 900 x f), LARECOMP_WIDE_TEST=<f> (forced shape).
@@ -111,9 +111,10 @@ void output_scale(double dw, double dh, bool reshape_allowed, double now, double
         // smaller - and at most the scene's size in it: 50% on a 1440-line screen stays 720 lines, 75% is 1080)
         double base = out_auto ? h_screen * 1080.0 / SCENE_LINES : hs, share = 1.0;
         if (mode == RES_DYNAMIC) { dyn_update(now, gpu_ms); share = g_dyn; }
-        else if (mode == RES_Q75) share = 0.75;
-        else if (mode == RES_Q25) share = 0.25;
-        else if (mode == RES_Q50) share = 0.5;
+        else {
+            int pct = res_mode_percent(mode);
+            if (pct) share = pct / 100.0;
+        }
         if (mode != RES_MATCH) hs = fmin(base * share, hs);
     }
     hs = fmax(hs, 0.1);

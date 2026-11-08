@@ -4,6 +4,7 @@
 #include <math.h>
 #include <pthread.h>
 #include <stdatomic.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -470,6 +471,41 @@ void vk_device_fault_report(void) {
 static bool display_timing;
 #endif
 
+#if defined(__linux__) && !defined(__ANDROID__)
+// Armada's manual GPU clock switches this node to the userspace governor and pins min_freq to max_freq.
+// Automatic mode stays on simple_ondemand and does not ask above the 587 MHz stock step. Read only.
+static bool sysfs_line(const char *path, char *buf, size_t n) {
+    FILE *f = fopen(path, "r");
+    if (!f) return false;
+    if (!fgets(buf, (int)n, f)) buf[0] = 0;
+    fclose(f);
+    char *nl = strchr(buf, '\n');
+    if (nl) *nl = 0;
+    return buf[0] != 0;
+}
+
+static void log_adreno_clock(void) {
+    const char *dir = "/sys/class/devfreq/3d00000.gpu";
+    char path[160], gov[64] = "", minb[32] = "", maxb[32] = "", curb[32] = "";
+    snprintf(path, sizeof path, "%s/governor", dir);
+    if (!sysfs_line(path, gov, sizeof gov)) return;
+    snprintf(path, sizeof path, "%s/min_freq", dir);
+    if (!sysfs_line(path, minb, sizeof minb)) minb[0] = 0;
+    snprintf(path, sizeof path, "%s/max_freq", dir);
+    if (!sysfs_line(path, maxb, sizeof maxb)) maxb[0] = 0;
+    snprintf(path, sizeof path, "%s/cur_freq", dir);
+    if (!sysfs_line(path, curb, sizeof curb)) curb[0] = 0;
+    unsigned long min = strtoul(minb, NULL, 10), max = strtoul(maxb, NULL, 10), cur = strtoul(curb, NULL, 10);
+    LOG("[vk] gpu clock: governor %s, min %lu Hz, max %lu Hz, current %lu Hz\n", gov, min, max, cur);
+    if (!strcmp(gov, "userspace") || (min && min == max))
+        LOG("[vk] gpu clock is pinned (%s). A manual clock has reset this machine from this game. "
+            "Automatic mode is simple_ondemand with a max of 587 MHz.\n",
+            !strcmp(gov, "userspace") ? "userspace governor" : "min equals max");
+    if (max > 587000000ul)
+        LOG("[vk] gpu max %lu Hz is above the 587 MHz stock ceiling automatic mode uses\n", max);
+}
+#endif
+
 static void create_device(void) {
     uint32_t ne = 0;
     vkEnumerateDeviceExtensionProperties(g_vk.phys, NULL, &ne, NULL);
@@ -906,6 +942,9 @@ static void create_device(void) {
     VkDeviceCreateInfo di = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &f, .queueCreateInfoCount = 1,
                              .pQueueCreateInfos = &qi, .enabledExtensionCount = n_ext, .ppEnabledExtensionNames = ext};
     VK_CHECK(vkCreateDevice(g_vk.phys, &di, NULL, &g_vk.dev));
+#if defined(__linux__) && !defined(__ANDROID__)
+    log_adreno_clock();
+#endif
 #ifdef __ANDROID__
     volkLoadDevice(g_vk.dev);
     compat_aliases();

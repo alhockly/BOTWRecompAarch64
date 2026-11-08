@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/prctl.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -30,14 +31,54 @@
 #ifndef MAP_FIXED_NOREPLACE
 #define MAP_FIXED_NOREPLACE 0x100000
 #endif
+#ifndef MADV_NOHUGEPAGE
+#define MADV_NOHUGEPAGE 15
+#endif
+#ifndef PR_SET_THP_DISABLE
+#define PR_SET_THP_DISABLE 41
+#endif
 
 extern char **environ;
+
+// LARECOMP_THP=1: leave transparent huge pages on, so a boot can be compared with the kernel's 2 MB fault path.
+static bool thp_keep(void) {
+    const char *e = getenv("LARECOMP_THP");
+    return e && atoi(e) != 0;
+}
+
+static void advise_no_thp(void *p, size_t n) {
+    if (thp_keep() || !p || !n) return;
+    madvise(p, n, MADV_NOHUGEPAGE);
+}
+
+void plat_disable_thp(void) {
+    char mode[80] = "unread";
+    FILE *f = fopen("/sys/kernel/mm/transparent_hugepage/enabled", "r");
+    if (f) {
+        if (!fgets(mode, sizeof mode, f)) mode[0] = 0;
+        fclose(f);
+        char *nl = strchr(mode, '\n');
+        if (nl) *nl = 0;
+    }
+    if (thp_keep()) {
+        fprintf(stderr, "[linux] transparent huge pages left on (LARECOMP_THP=1); kernel policy: %s\n", mode);
+        return;
+    }
+    int r = prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
+    fprintf(stderr, "[linux] transparent huge pages %s; kernel policy: %s\n",
+            r == 0 ? "disabled for this process" : "could not be disabled", mode);
+}
+
+void plat_nohugepage(uint64_t addr, uint64_t size) {
+    advise_no_thp((void *)(uintptr_t)addr, (size_t)size);
+}
 
 bool plat_reserve_guest(uint64_t lo, uint64_t hi) {
     void *p = mmap((void *)(uintptr_t)lo, hi - lo, PROT_READ | PROT_WRITE,
                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0);
     if (p == MAP_FAILED) return false;
     if (p != (void *)(uintptr_t)lo) { munmap(p, hi - lo); return false; }
+    advise_no_thp(p, (size_t)(hi - lo));
     return true;
 }
 
@@ -96,8 +137,11 @@ bool plat_reset_guest(uint64_t lo, uint64_t hi) {
         memset(wt_state + ((a - wt_lo) >> 12), 0, (size_t)((e - a) >> 12));
         wt_unlock();
     }
-    return mmap((void *)(uintptr_t)lo, hi - lo, PROT_READ | PROT_WRITE,
-                MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED, -1, 0) == (void *)(uintptr_t)lo;
+    void *p = mmap((void *)(uintptr_t)lo, hi - lo, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED, -1, 0);
+    if (p != (void *)(uintptr_t)lo) return false;
+    advise_no_thp(p, (size_t)(hi - lo));
+    return true;
 }
 
 void plat_commit(uint64_t addr, uint64_t size) { (void)addr; (void)size; }

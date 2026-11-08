@@ -581,17 +581,19 @@ static void tab_display(void) {
 
     opt_section("Rendering");
     // display order -> RES_* (the ini / enum order predates the menu order)
-    // (up to 4x: 7680 x 4320, 8K - more only ran out of GPU memory, and sat next to 75% in the list)
-    // (Match display in the middle: left from it 75% / 50% / 25%, right Dynamic then 1x-4x; user 2026-10-11)
-#ifdef __ANDROID__  // (3x / 4x: 4K / 8K, beyond a phone)
-    static const char *res[] = {"25%", "50%", "75%", "Match display", "Dynamic", "1x", "2x"};
-    static const int res_mode[] = {RES_Q25, RES_Q50, RES_Q75, RES_MATCH, RES_DYNAMIC, 1, 2};
+    // (up to 4x: 7680 x 4320, 8K - more only ran out of GPU memory)
+    // Shares of the display climb in 5% steps from 25% to 95%. Match display sits after them, then Dynamic and
+    // 1x-4x. 3x / 4x are 4K / 8K, past a phone, so Android stops at 2x.
+    static const char *res[] = {"25%", "30%", "35%", "40%", "45%", "50%", "55%", "60%", "65%", "70%", "75%", "80%", "85%", "90%", "95%",
+                                "Match display", "Dynamic", "1x", "2x", "3x", "4x"};
+    static const int res_mode[] = {RES_Q25, 30, 35, 40, 45, RES_Q50, 55, 60, 65, 70, RES_Q75, 80, 85, 90, 95,
+                                   RES_MATCH, RES_DYNAMIC, 1, 2, 3, 4};
+    enum { RES_MATCH_AT = 15 };  // ("Match display": the row's unchanged value)
+#ifdef __ANDROID__
+    enum { NRES = 19 };  // (through 2x)
 #else
-    static const char *res[] = {"25%", "50%", "75%", "Match display", "Dynamic", "1x", "2x", "3x", "4x"};
-    static const int res_mode[] = {RES_Q25, RES_Q50, RES_Q75, RES_MATCH, RES_DYNAMIC, 1, 2, 3, 4};
-#endif
-    enum { RES_MATCH_AT = 3 };
     enum { NRES = sizeof res_mode / sizeof res_mode[0] };
+#endif
     {
         int ri = RES_MATCH_AT;
         for (int i = 0; i < NRES; i++) if (res_mode[i] == g_settings.res_mode) ri = i;
@@ -601,7 +603,7 @@ static void tab_display(void) {
         int n = snprintf(d, sizeof d, tr("How sharp the 3D image is (the HUD is drawn at the Output resolution). Match "
                                          "display: the final image's resolution (your screen's, unless Output resolution is "
                                          "lower). Dynamic: as sharp as your GPU keeps at "
-                                         "full speed. 1x-2x: the Switch's 900p times that. 75%% / 50%% / 25%%: a share of the "
+                                         "full speed. 1x and above: the Switch's 900p times that. 25%% through 95%%, in steps of 5: a share of the "
                                          "display, for slower devices.\n\nRendering the 3D image at %.0f x %.0f."),
                          1600.0 * sx, 900.0 * sy);
         if (g_settings.res_mode == RES_DYNAMIC && n > 0 && n < (int)sizeof d)

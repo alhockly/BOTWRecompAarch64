@@ -11,7 +11,7 @@ It is built on the engine of **[LAS Recomp](https://github.com/peiikai/LASRecomp
 *Link's Awakening*) and its Android port, **[LASRecompAndroid](https://github.com/mamcjr/LASRecompAndroid)**.
 
 > [!WARNING]
-> **Beta.** Tested primarily on one phone (POCO F7 Ultra, Adreno 830, Mesa Turnip driver). Performance and compatibility
+> **Beta.** Tested primarily on one arm handheld (RP5, Adreno 650, Mesa Turnip driver). Performance and compatibility
 > vary by device; expect bugs, especially on GPUs that have not been tested on physical hardware. See the
 > [0.3.1-beta release notes](https://github.com/mamcjr/BOTWRecompAndroid/releases/tag/v0.3.1-beta) and the
 > [development notes](docs/BOTW-PORT.md) (in Portuguese).

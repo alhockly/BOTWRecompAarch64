@@ -313,9 +313,12 @@ void settings_load(void) {
 #endif
         else if (!strcmp(key, "resolution")) {
             int n = atoi(val);
-            g_settings.res_mode = !strcmp(val, "dynamic") ? RES_DYNAMIC : (!strcmp(val, "75%") || !strcmp(val, "67%")) ? RES_Q75 :
-                                  !strcmp(val, "50%") ? RES_Q50 : !strcmp(val, "25%") ? RES_Q25 :
-                                  (n >= 1 && n <= 4) ? n : n > 4 ? 4 : RES_MATCH;  // (5x-8x were removed)
+            if (!strcmp(val, "dynamic")) g_settings.res_mode = RES_DYNAMIC;
+            else if (strchr(val, '%')) {  // (67% was the old 75% slot)
+                int p = n == 67 ? 75 : n;
+                g_settings.res_mode = p == 25 ? RES_Q25 : p == 50 ? RES_Q50 : p == 75 ? RES_Q75 :
+                                      (p >= 30 && p <= 95 && p % 5 == 0) ? p : RES_MATCH;
+            } else g_settings.res_mode = (n >= 1 && n <= 4) ? n : n > 4 ? 4 : RES_MATCH;  // (5x-8x were removed)
         }
         else if (!strcmp(key, "upscaler"))  // (metalfx / fsr1: this OS's sharp one)
             g_settings.upscaler = !strcmp(val, "bilinear") ? UPSCALE_BILINEAR
@@ -404,9 +407,7 @@ void settings_save(void) {
     else fprintf(f, "output = %s\n", g_settings.out_lines == OUT_AUTO ? "auto" : "screen");
     fprintf(f, "antialias = %s\n", g_settings.antialias == AA_SMAA ? "smaa" : g_settings.antialias == AA_FXAA ? "fxaa" : "off");
     if (g_settings.res_mode == RES_DYNAMIC) fprintf(f, "resolution = dynamic\n");
-    else if (g_settings.res_mode == RES_Q75) fprintf(f, "resolution = 75%%\n");
-    else if (g_settings.res_mode == RES_Q25) fprintf(f, "resolution = 25%%\n");
-    else if (g_settings.res_mode == RES_Q50) fprintf(f, "resolution = 50%%\n");
+    else if (res_mode_percent(g_settings.res_mode)) fprintf(f, "resolution = %d%%\n", res_mode_percent(g_settings.res_mode));
     else if (g_settings.res_mode >= 1 && g_settings.res_mode <= 8) fprintf(f, "resolution = %dx\n", g_settings.res_mode);
     else fprintf(f, "resolution = match\n");
     fprintf(f, "language = %s\n", g_language_codes[g_settings.language > LANG_AUTO && g_settings.language < N_LANGUAGES

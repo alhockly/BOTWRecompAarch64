@@ -87,6 +87,9 @@ static void rtld_start_legacy(Cpu *c) {
 // Claim the guest address range before anything else can map there. The host allocator places
 // regions at random addresses in the same window; on a collision, re-exec for a fresh layout.
 __attribute__((constructor(101))) static void reserve_guest_space(void) {
+#if defined(__linux__) && !defined(__ANDROID__)
+    plat_disable_thp();  // before the guest window is touched: the kernel's 2 MB fault path locked this process
+#endif
     if (plat_reserve_guest(GUEST_LO, GUEST_HI)) return;
     const char *tries = getenv("LARECOMP_REEXEC");
     int n = tries ? atoi(tries) : 0;

@@ -18,6 +18,12 @@ extern "C" {
 // ---- guest address space
 // Claim [lo, hi) for the guest at exactly that address, readable/writable (pages may be backed lazily).
 bool plat_reserve_guest(uint64_t lo, uint64_t hi);
+#if defined(__linux__) && !defined(__ANDROID__)
+// Before any guest page is touched: no transparent huge pages for this process (LARECOMP_THP=1 leaves them on).
+void plat_disable_thp(void);
+// MADV_NOHUGEPAGE on a mapping the process just created (a placed GPU heap replaces the anonymous pages).
+void plat_nohugepage(uint64_t addr, uint64_t size);
+#endif
 // Make sure [addr, addr+size) inside the guest window is backed (before the OS itself writes there, e.g.
 // file reads); a no-op where the whole window is backed from the start.
 void plat_commit(uint64_t addr, uint64_t size);

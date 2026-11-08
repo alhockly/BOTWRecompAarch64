@@ -5,6 +5,15 @@
 enum { ASPECT_UNLOCKED = 0, ASPECT_ORIGINAL = 1 };
 enum { RES_MATCH = 0, /* 1..8 = 1x..8x */ RES_DYNAMIC = 9, RES_Q75 = 10, RES_Q25 = 11, RES_Q50 = 12 };
 // (11 was 67% of the display: larecomp.ini "67%" now loads as RES_Q75)
+// 30 through 95, in steps of 5, are stored as the percent itself. 25 / 50 / 75 keep the values above so an
+// existing ini still loads. 0 means this mode is not a share of the display.
+static inline int res_mode_percent(int mode) {
+    if (mode == RES_Q25) return 25;
+    if (mode == RES_Q50) return 50;
+    if (mode == RES_Q75) return 75;
+    if (mode >= 30 && mode <= 95 && mode % 5 == 0) return mode;
+    return 0;
+}
 enum { OUT_AUTO = -1 };  // (Settings.out_lines)
 enum { UPSCALE_BILINEAR = 0, UPSCALE_METALFX = 1 /* macOS */, UPSCALE_FSR1 = 2 /* AMD FSR 1 */,
        UPSCALE_SGSR1 = 3 /* Vulkan: Snapdragon Game Super Resolution 1 */ };
@@ -24,7 +33,7 @@ extern const char *const g_language_names[N_LANGUAGES];  // for the menu ("Auto"
 typedef struct {
     int aspect;          // ASPECT_*: unlocked = fill the window (wider/taller views), original = 16:9 with bars
     bool fullscreen;
-    int res_mode;        // RES_MATCH, 1..4 (N x the Switch's 1080p), RES_DYNAMIC, RES_Q75/50/25 (share of the display)
+    int res_mode;        // RES_MATCH, 1..4 (N x the Switch's 1080p), RES_DYNAMIC, or a share of the display (res_mode_percent)
     int upscaler;        // UPSCALE_*: how a lower internal resolution reaches the window (MetalFX: macOS, FSR 1: Windows)
     int out_lines;       // Output resolution: the final image (scene + HUD) at most this many lines, scaled up to the
                          // screen at the end (0: the screen's own; 1080 / 900 / 720; OUT_AUTO: 1080 on taller
