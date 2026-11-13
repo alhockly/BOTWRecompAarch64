@@ -5,6 +5,7 @@
 #include <unistd.h>
 
 #include "../kernel.h"
+#include "../platform.h"
 #include "../settings.h"
 #include "../framepace.h"
 #include "nvn.h"
@@ -1491,7 +1492,12 @@ NVN(nvnQueuePresentTexture) {
     {   // (which guest thread presents: LARECOMP_PROF_SVC_TID, kernel.c)
         static uint64_t last_id = ~0ull;
         KThread *kt = kernel_current_thread();
-        if (kt && kt->id != last_id) LOG("[pace] presenting thread t%llu\n", (unsigned long long)(last_id = kt->id));
+        if (kt && kt->id != last_id) {
+            LOG("[pace] presenting thread t%llu\n", (unsigned long long)(last_id = kt->id));
+#if defined(__linux__) && !defined(__ANDROID__)
+            plat_pin_big_cores();  // (the game's half of the frame: platform/linux.c)
+#endif
+        }
     }
     {   // Frame limiter: a present waits until N vsyncs have gone by since the previous one, as NVN does on the Switch -
         // N is the larger of the window's interval (BOTW asks for 2: its world steps 1/30 s a frame) and the Video

@@ -202,7 +202,11 @@ static void boot(const char *root) {
     loader_load(exefs);
     { extern void settings_load(void); settings_load(); }
     kernel_init();
-    if (!native_on()) dispatch_init();
+    if (!native_on()) {
+        dispatch_init();
+        extern void vfx_alloc_install(void);
+        vfx_alloc_install();
+    }
     native_prepare();
 
     uint32_t stack_size = 0x100000;

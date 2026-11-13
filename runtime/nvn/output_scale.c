@@ -121,6 +121,32 @@ void output_scale(double dw, double dh, bool reshape_allowed, double now, double
     o->scene_sx = hs * shape; o->scene_sy = hs;
     double scap = fmin(MAX_TEX / (1920.0 * o->scene_sx), MAX_TEX / (1080.0 * o->scene_sy));
     if (scap < 1.0) { o->scene_sx *= scap; o->scene_sy *= scap; }
+    // The scene's targets are 1600x900 and that size in 5% steps (1520x855 .. 1280x720), and the half-size
+    // buffers are half of those (800x450, 640x360, ...). Each target is allocated at lround(guest * scale)
+    // (vulkan/textures.c). A scale that is not a multiple of 1/40 in x and 1/45 in y makes one of those
+    // sizes fractional - 45% of a 1080p display is 0.54, and 1280*0.54 is 691.2 - and the half-size image
+    // is then not exactly half the full one. The pass that brings the half-size lighting back reads a texel
+    // off on a grid: a checker over the scene, and pieces a pixel wide drop out. 50% and 1x land on a scale
+    // that already divides, which is why they stay clean. On a square pixel (16:9) the height snaps to the
+    // multiple of 1/45 nearest the snapped width, so the two axes stay within about a percent of each other.
+    {
+        double nx = round(o->scene_sx * 40.0);
+        if (nx < 1) nx = 1;
+        if (fabs(o->scene_sx - o->scene_sy) <= 0.01 * fmax(o->scene_sy, 0.01)) {
+            o->scene_sx = nx / 40.0;
+            double ny = round(o->scene_sx * 45.0);
+            if (ny < 1) ny = 1;
+            o->scene_sy = ny / 45.0;
+        } else {
+            double ny = round(o->scene_sy * 45.0);
+            if (ny < 1) ny = 1;
+            o->scene_sx = nx / 40.0;
+            o->scene_sy = ny / 45.0;
+        }
+        while (1920.0 * o->scene_sx > MAX_TEX && nx > 1) { nx -= 1; o->scene_sx = nx / 40.0; }
+        double ny = round(o->scene_sy * 45.0);
+        while (1080.0 * o->scene_sy > MAX_TEX && ny > 1) { ny -= 1; o->scene_sy = ny / 45.0; }
+    }
     // where the image goes in the window: fills it when reshaped, else a fitted 16:9 box
     if (reshape) { o->vw = dw; o->vh = dh; }
     else { o->vw = 1920.0 * fit; o->vh = 1080.0 * fit; }

@@ -213,6 +213,7 @@ static void *render_main(void *arg) {
 // does not. One present per call, then back to the window loop, so input and close still run.
 void vk_async_bind_service_thread(void) {
     if (!vk_async_on()) return;
+    plat_pin_big_cores();  // (this thread translates the frame and presents it)
     g_vk_render_thread = pthread_self();
     g_vk_render_started = true;
 }

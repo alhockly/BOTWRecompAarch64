@@ -20,6 +20,7 @@
 #include <sys/prctl.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <ucontext.h>
@@ -49,6 +50,95 @@ static bool thp_keep(void) {
 static void advise_no_thp(void *p, size_t n) {
     if (thp_keep() || !p || !n) return;
     madvise(p, n, MADV_NOHUGEPAGE);
+}
+
+// Cores faster than the slowest cluster (the RP5: cpu 4-7). The window thread and the presenting thread run there;
+// every other guest thread is put back on the full set (it would otherwise inherit the mask). One cluster, or
+// LARECOMP_BIG_CORES=0: nothing changes.
+static cpu_set_t g_all_cores, g_big_cores;
+static int g_big_ready;  // 0 untried, 1 the big set is in use, -1 nothing to do
+static pthread_once_t g_big_once = PTHREAD_ONCE_INIT;
+
+static void big_cores_init(void) {
+    if (sched_getaffinity(0, sizeof g_all_cores, &g_all_cores)) { g_big_ready = -1; return; }
+    const char *e = getenv("LARECOMP_BIG_CORES");
+    if (e && !atoi(e)) { g_big_ready = -1; return; }
+    long mhz[64] = {0}, slow = 0;
+    int n = 0;
+    for (int c = 0; c < 64; c++) {
+        if (!CPU_ISSET(c, &g_all_cores)) continue;
+        char path[80];
+        snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", c);
+        FILE *f = fopen(path, "re");
+        long m = 0;
+        if (f) { if (fscanf(f, "%ld", &m) != 1) m = 0; fclose(f); }
+        mhz[c] = m;
+        if (m && (!slow || m < slow)) slow = m;
+        n = c + 1;
+    }
+    CPU_ZERO(&g_big_cores);
+    char list[128];
+    int pos = 0, k = 0;
+    list[0] = 0;
+    for (int c = 0; c < n; c++)
+        if (mhz[c] > slow) {
+            CPU_SET(c, &g_big_cores);
+            int w = snprintf(list + pos, sizeof list - (size_t)pos, "%s%d", pos ? "," : "", c);
+            if (w > 0 && pos + w < (int)sizeof list) pos += w;
+            k++;
+        }
+    if (!slow || !k) { g_big_ready = -1; return; }
+    g_big_ready = 1;
+    LOG("[linux] frame threads on the big cores: %s\n", list);
+}
+
+// A utilization floor for the frame threads (LARECOMP_UCLAMP_MIN=<0-1024>, default 768; 0: off). schedutil sets a
+// core's clock from its threads' recent load, and a thread that works in bursts each frame starts each burst on a
+// core idling at 0.7-1.1 GHz of its 2.4-2.8 (the RP5's big cores). With the floor its core runs near its top clock
+// while the thread runs. Per thread and inherited on creation, so a guest thread clears it at start.
+static int uclamp_min_value(void) {
+    static int want = -1;
+    if (want < 0) {
+        const char *e = getenv("LARECOMP_UCLAMP_MIN");
+        want = e ? atoi(e) : 768;
+        if (want < 0) want = 0;
+        if (want > 1024) want = 1024;
+    }
+    return want;
+}
+
+static int set_uclamp_min(int value) {
+    struct {
+        uint32_t size, policy;
+        uint64_t flags;
+        int32_t nice;
+        uint32_t priority;
+        uint64_t runtime, deadline, period;
+        uint32_t util_min, util_max;
+    } attr = {.size = 56, .flags = 0x08 | 0x10 | 0x20, .util_min = (uint32_t)value};  // (KEEP_POLICY | KEEP_PARAMS |
+                                                                                     //  UTIL_CLAMP_MIN; struct ver. 1)
+    return (int)syscall(SYS_sched_setattr, 0, &attr, 0);
+}
+
+void plat_pin_big_cores(void) {
+    pthread_once(&g_big_once, big_cores_init);
+    if (g_big_ready == 1 && sched_setaffinity(0, sizeof g_big_cores, &g_big_cores)) {
+        static int told;
+        if (!told++) LOG("[linux] frame thread could not be pinned: %s\n", strerror(errno));
+    }
+    int floor = uclamp_min_value();
+    if (floor) {
+        int r = set_uclamp_min(floor);
+        static atomic_int logged;
+        if (!atomic_exchange(&logged, 1))
+            LOG("[linux] frame threads' utilization floor %d: %s\n", floor, r ? strerror(errno) : "ok");
+    }
+}
+
+void plat_reset_affinity(void) {
+    pthread_once(&g_big_once, big_cores_init);
+    if (g_big_ready == 1) sched_setaffinity(0, sizeof g_all_cores, &g_all_cores);
+    if (uclamp_min_value()) set_uclamp_min(0);
 }
 
 void plat_disable_thp(void) {

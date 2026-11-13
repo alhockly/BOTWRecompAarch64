@@ -369,6 +369,8 @@ static void *thread_main(void *arg) {
     t_cur = t;
 #ifdef __ANDROID__
     plat_thread_unpin();  // (not the presenting thread's fast cores: platform.h)
+#elif defined(__linux__)
+    plat_reset_affinity();  // (not the frame threads' big cores: a guest thread inherits its creator's mask)
 #endif
     crash_handler_install();
     rt_set_fpcr(0);

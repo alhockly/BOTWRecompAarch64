@@ -110,11 +110,16 @@ typedef struct {
     int game_cpu, render_cpu;  // the core each last ran on (-1: unknown)
 } PlatAdpfStats;
 void plat_adpf_stats(PlatAdpfStats *out);
-#ifdef __ANDROID__
 // A new thread back on every core: threads inherit the creating thread's affinity, and the presenting thread is
 // pinned to the fastest cores (platform/android.c)
 void plat_thread_unpin(void);
 #endif
+
+#if defined(__linux__) && !defined(__ANDROID__)
+// The window thread and the presenting thread on the cores faster than the slowest cluster (linux.c). A guest thread
+// starts back on the full set, so it does not inherit that mask. LARECOMP_BIG_CORES=0: off.
+void plat_pin_big_cores(void);
+void plat_reset_affinity(void);
 #endif
 
 #ifdef __cplusplus
