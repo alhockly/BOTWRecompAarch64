@@ -1523,8 +1523,14 @@ void vk_async_drain(void);
 // costs a dynamic TLS resolve per read in this dlopened library)
 extern pthread_t g_vk_render_thread;
 extern bool g_vk_render_started;
+extern int g_vk_translate_on;
+extern pthread_t g_vk_translate_thread;
 uint64_t renderer_present_count(void) {
-    if (g_vk_render_started && pthread_equal(pthread_self(), g_vk_render_thread)) return total_frames;
+    if (g_vk_render_started) {
+        pthread_t self = pthread_self();
+        if (pthread_equal(self, g_vk_render_thread)) return total_frames;
+        if (g_vk_translate_on && pthread_equal(self, g_vk_translate_thread)) return total_frames;
+    }
     return vk_async_on() ? g_game_frames : total_frames;
 }
 #else
@@ -2225,7 +2231,7 @@ int ui_run(void) {
     for (;;) {
         if (rt_reboot_requested()) return rt_reboot_requested();  // (runtime/main.c tears the game down)
 #if !defined(__ANDROID__)
-        vk_async_service();  // (one frame of translation and present, on this thread)
+        vk_async_service();  // (a parked present; translation runs on its own thread)
 #endif
         SDL_Event e;
 #ifdef __ANDROID__

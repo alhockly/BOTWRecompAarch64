@@ -370,7 +370,7 @@ static void *thread_main(void *arg) {
 #ifdef __ANDROID__
     plat_thread_unpin();  // (not the presenting thread's fast cores: platform.h)
 #elif defined(__linux__)
-    plat_reset_affinity();  // (not the frame threads' big cores: a guest thread inherits its creator's mask)
+    plat_reset_affinity();  // (every core faster than the slowest cluster; LARECOMP_BIG_THREADS=frame: the full set)
 #endif
     crash_handler_install();
     rt_set_fpcr(0);

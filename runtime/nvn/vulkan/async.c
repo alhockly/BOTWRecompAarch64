@@ -37,6 +37,12 @@ static pthread_cond_t q_more = PTHREAD_COND_INITIALIZER, q_less = PTHREAD_COND_I
 static pthread_mutex_t p_lock = PTHREAD_MUTEX_INITIALIZER;  // producers: an id, its list's fences and its push together
 pthread_t g_vk_render_thread;  // (also read by device.c renderer_present_count, many times a draw)
 bool g_vk_render_started;
+#if !defined(__ANDROID__)
+int g_vk_translate_on;             // (desktop: a thread translates, the window thread presents)
+pthread_t g_vk_translate_thread;
+static int g_present_ready;       // (worker has stopped at a PRESENT and released the renderer)
+static void service_present(void);
+#endif
 // What the queue thread is inside, for a wait that has already lasted seconds (the game thread logs it).
 static int busy_kind = -1;
 static uint64_t busy_id;
@@ -70,14 +76,22 @@ bool vk_async_on(void) {
 #ifdef __ANDROID__
                     "a render thread",
 #else
-                    "the window thread",
+                    "a translation thread",
 #endif
                     ahead, ahead > 1 ? "s" : "");
     }
     return on;
 }
 
-bool vk_async_is_render_thread(void) { return g_vk_render_started && pthread_equal(pthread_self(), g_vk_render_thread); }
+static __thread int in_queue_request;  // (drain on the thread inside a request would wait for itself)
+
+bool vk_async_is_render_thread(void) {
+    if (in_queue_request) return true;
+#if !defined(__ANDROID__)
+    if (g_vk_translate_on) return g_vk_render_started && pthread_equal(pthread_self(), g_vk_translate_thread);
+#endif
+    return g_vk_render_started && pthread_equal(pthread_self(), g_vk_render_thread);
+}
 
 // Thread CPU time excludes GPU fences, swapchain acquisition and time descheduled by Android.
 static uint64_t render_cpu_ns(void) {
@@ -129,6 +143,14 @@ static void wait_room(int type) {
 
 static void wait_done(uint64_t id) {  // q_lock held on entry and on return
     while (q_done < id) {
+#if !defined(__ANDROID__)
+        if (g_present_ready && g_vk_render_started && pthread_equal(pthread_self(), g_vk_render_thread)) {
+            pthread_mutex_unlock(&q_lock);
+            service_present();  // (this thread is the one the worker is waiting on)
+            pthread_mutex_lock(&q_lock);
+            continue;
+        }
+#endif
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
         ts.tv_sec += 5;
@@ -150,6 +172,7 @@ void vk_async_wake_window(void);  // device.c: SDL_PushEvent, so the window thre
 
 // One queued request. q_lock is not held. The request stays in the ring until the caller advances q_head.
 static bool run_request(Req r) {
+    in_queue_request = 1;
     __atomic_store_n(&busy_id, r.id, __ATOMIC_RELAXED);
     __atomic_store_n(&busy_kind, r.type, __ATOMIC_RELEASE);
     // Keep the established ADPF signal by default. CPU-only timing is an explicit experiment:
@@ -181,6 +204,7 @@ static bool run_request(Req r) {
         frame_work = frame_cpu = 0;
     }
     __atomic_store_n(&busy_kind, -1, __ATOMIC_RELEASE);
+    in_queue_request = 0;
     return present;
 }
 
@@ -208,26 +232,75 @@ static void *render_main(void *arg) {
     return NULL;
 }
 #else
-// Desktop Linux: the window thread runs the queue (vk_async_service). A third thread presenting through Wayland
-// while this thread blocks in SDL_WaitEvent deadlocks; the game then waits on the queue and frames stop, audio
-// does not. One present per call, then back to the window loop, so input and close still run.
+// Desktop Linux: a worker translates. The window thread only presents (vk_async_service). Presenting from the
+// worker while this thread blocks in SDL_WaitEvent deadlocks; the game then waits on the queue and frames stop.
+// LARECOMP_VK_TRANSLATE_THREAD=0: this thread translates too, one present per call, as before.
+static void service_present(void) {  // the parked PRESENT, on the window thread. q_lock is not held.
+    pthread_mutex_lock(&q_lock);
+    if (!g_present_ready) { pthread_mutex_unlock(&q_lock); return; }
+    Req r = q[q_head % QN];
+    pthread_mutex_unlock(&q_lock);
+    run_request(r);
+    pthread_mutex_lock(&q_lock);
+    finish_request(r);
+    g_present_ready = 0;
+    pthread_cond_broadcast(&q_less);
+    pthread_mutex_unlock(&q_lock);
+}
+
+static void *translate_main(void *arg) {
+    (void)arg;
+    plat_pin_prime_core();
+    pthread_mutex_lock(&q_lock);
+    for (;;) {
+        while (q_head == q_tail) pthread_cond_wait(&q_more, &q_lock);
+        Req r = q[q_head % QN];
+        if (r.type == REQ_PRESENT) {
+            g_present_ready = 1;
+            pthread_cond_broadcast(&q_less);
+            pthread_mutex_unlock(&q_lock);
+            vk_async_wake_window();
+            pthread_mutex_lock(&q_lock);
+            while (g_present_ready) pthread_cond_wait(&q_less, &q_lock);
+            continue;
+        }
+        pthread_mutex_unlock(&q_lock);
+        run_request(r);
+        pthread_mutex_lock(&q_lock);
+        finish_request(r);
+    }
+    return NULL;
+}
+
 void vk_async_bind_service_thread(void) {
     if (!vk_async_on()) return;
-    plat_pin_big_cores();  // (this thread translates the frame and presents it)
+    plat_pin_big_cores();  // (this thread presents; translation has the prime core)
     g_vk_render_thread = pthread_self();
     g_vk_render_started = true;
+    const char *e = getenv("LARECOMP_VK_TRANSLATE_THREAD");
+    if (e && atoi(e) == 0) {
+        LOG("[vk] async: command lists translated on the window thread\n");
+        return;
+    }
+    if (pthread_create(&g_vk_translate_thread, NULL, translate_main, NULL)) {
+        LOG("[vk] async: translation thread did not start: %s\n", strerror(errno));
+        return;
+    }
+    g_vk_translate_on = 1;
+    LOG("[vk] async: translation on its own thread, present on the window thread\n");
 }
 
 bool vk_async_pending(void) {
     if (!g_vk_render_started) return false;
     pthread_mutex_lock(&q_lock);
-    bool pending = q_head != q_tail;
+    bool pending = g_vk_translate_on ? g_present_ready : q_head != q_tail;
     pthread_mutex_unlock(&q_lock);
     return pending;
 }
 
 void vk_async_service(void) {
     if (!vk_async_on() || !g_vk_render_started || !pthread_equal(pthread_self(), g_vk_render_thread)) return;
+    if (g_vk_translate_on) { service_present(); return; }
     for (int n = 0; n < 64; n++) {
         pthread_mutex_lock(&q_lock);
         if (q_head == q_tail) { pthread_mutex_unlock(&q_lock); return; }
@@ -281,7 +354,7 @@ static uint64_t publish(int type, uint64_t a, void *p, void (*mark)(uint64_t id,
         pthread_mutex_unlock(&q_lock);
         pthread_mutex_unlock(&p_lock);
 #ifndef __ANDROID__
-        vk_async_wake_window();
+        if (!g_vk_translate_on) vk_async_wake_window();  // (the worker wakes the window when a present is parked)
 #endif
         return id;
     }

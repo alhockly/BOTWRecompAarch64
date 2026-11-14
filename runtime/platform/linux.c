@@ -52,44 +52,75 @@ static void advise_no_thp(void *p, size_t n) {
     madvise(p, n, MADV_NOHUGEPAGE);
 }
 
-// Cores faster than the slowest cluster (the RP5: cpu 4-7). The window thread and the presenting thread run there;
-// every other guest thread is put back on the full set (it would otherwise inherit the mask). One cluster, or
-// LARECOMP_BIG_CORES=0: nothing changes.
-static cpu_set_t g_all_cores, g_big_cores;
-static int g_big_ready;  // 0 untried, 1 the big set is in use, -1 nothing to do
+// Cores read from cpuinfo_max_freq, then kept only where this process may run. The slowest cluster is left out
+// (the RP5: cpu 0-3). Every core faster than that is g_fast_cores (cpu 4-7): guest threads start there.
+// LARECOMP_BIG_THREADS=frame: guests stay on the full set. A cluster faster than the other fast cores is the prime
+// core (cpu 7, translation). The window thread runs on the rest of the fast cores (cpu 4-6). One fast cluster, or
+// LARECOMP_BIG_CORES=0: translation shares the big set, or nothing is pinned.
+static cpu_set_t g_all_cores, g_big_cores, g_prime_cores, g_fast_cores;
+static int g_big_ready;  // 0 untried, 1 the sets are in use, -1 nothing to do
 static pthread_once_t g_big_once = PTHREAD_ONCE_INIT;
+
+static void format_set(const cpu_set_t *set, char *list, int nlist) {
+    int pos = 0;
+    list[0] = 0;
+    for (int c = 0; c < 64; c++) {
+        if (!CPU_ISSET(c, set)) continue;
+        int w = snprintf(list + pos, (size_t)nlist - (size_t)pos, "%s%d", pos ? "," : "", c);
+        if (w > 0 && pos + w < nlist) pos += w;
+    }
+}
 
 static void big_cores_init(void) {
     if (sched_getaffinity(0, sizeof g_all_cores, &g_all_cores)) { g_big_ready = -1; return; }
     const char *e = getenv("LARECOMP_BIG_CORES");
     if (e && !atoi(e)) { g_big_ready = -1; return; }
-    long mhz[64] = {0}, slow = 0;
+    long mhz[64] = {0}, slow = 0, fast = 0;
     int n = 0;
     for (int c = 0; c < 64; c++) {
-        if (!CPU_ISSET(c, &g_all_cores)) continue;
         char path[80];
         snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", c);
         FILE *f = fopen(path, "re");
+        if (!f) continue;
         long m = 0;
-        if (f) { if (fscanf(f, "%ld", &m) != 1) m = 0; fclose(f); }
+        if (fscanf(f, "%ld", &m) != 1) m = 0;
+        fclose(f);
         mhz[c] = m;
         if (m && (!slow || m < slow)) slow = m;
+        if (m > fast) fast = m;
         n = c + 1;
     }
     CPU_ZERO(&g_big_cores);
-    char list[128];
-    int pos = 0, k = 0;
-    list[0] = 0;
-    for (int c = 0; c < n; c++)
-        if (mhz[c] > slow) {
-            CPU_SET(c, &g_big_cores);
-            int w = snprintf(list + pos, sizeof list - (size_t)pos, "%s%d", pos ? "," : "", c);
-            if (w > 0 && pos + w < (int)sizeof list) pos += w;
-            k++;
-        }
-    if (!slow || !k) { g_big_ready = -1; return; }
+    CPU_ZERO(&g_prime_cores);
+    CPU_ZERO(&g_fast_cores);
+    for (int c = 0; c < n; c++) {
+        if (!mhz[c] || !CPU_ISSET(c, &g_all_cores)) continue;
+        if (mhz[c] > slow) CPU_SET(c, &g_fast_cores);
+        if (mhz[c] == fast && fast > slow) CPU_SET(c, &g_prime_cores);
+        if (mhz[c] > slow && mhz[c] < fast) CPU_SET(c, &g_big_cores);
+    }
+    int big_n = 0, prime_n = 0;
+    for (int c = 0; c < n; c++) {
+        if (CPU_ISSET(c, &g_big_cores)) big_n++;
+        if (CPU_ISSET(c, &g_prime_cores)) prime_n++;
+    }
+    if (!big_n) g_big_cores = g_prime_cores;  // one fast tier: no core between the slowest and the fastest
+    if (!prime_n) g_prime_cores = g_big_cores;
+    big_n = 0;
+    for (int c = 0; c < n; c++) if (CPU_ISSET(c, &g_big_cores)) big_n++;
+    if (!slow || !big_n) { g_big_ready = -1; return; }
     g_big_ready = 1;
-    LOG("[linux] frame threads on the big cores: %s\n", list);
+    char bigs[128], primes[128], fasts[128];
+    format_set(&g_big_cores, bigs, (int)sizeof bigs);
+    format_set(&g_prime_cores, primes, (int)sizeof primes);
+    format_set(&g_fast_cores, fasts, (int)sizeof fasts);
+    LOG("[linux] frame threads on the big cores: %s\n", bigs);
+    LOG("[linux] translation on the prime core: %s\n", primes);
+    {   // LARECOMP_BIG_THREADS=frame: guests keep the full set (the frame threads stay pinned)
+        const char *t = getenv("LARECOMP_BIG_THREADS");
+        if (t && !strcmp(t, "frame")) LOG("[linux] guest threads on the full set\n");
+        else LOG("[linux] guest threads on the big cores: %s\n", fasts);
+    }
 }
 
 // A utilization floor for the frame threads (LARECOMP_UCLAMP_MIN=<0-1024>, default 768; 0: off). schedutil sets a
@@ -120,11 +151,11 @@ static int set_uclamp_min(int value) {
     return (int)syscall(SYS_sched_setattr, 0, &attr, 0);
 }
 
-void plat_pin_big_cores(void) {
+static void pin_cores(const cpu_set_t *set, const char *what) {
     pthread_once(&g_big_once, big_cores_init);
-    if (g_big_ready == 1 && sched_setaffinity(0, sizeof g_big_cores, &g_big_cores)) {
+    if (g_big_ready == 1 && sched_setaffinity(0, sizeof *set, set)) {
         static int told;
-        if (!told++) LOG("[linux] frame thread could not be pinned: %s\n", strerror(errno));
+        if (!told++) LOG("[linux] %s could not be pinned: %s\n", what, strerror(errno));
     }
     int floor = uclamp_min_value();
     if (floor) {
@@ -135,10 +166,18 @@ void plat_pin_big_cores(void) {
     }
 }
 
+void plat_pin_big_cores(void) { pin_cores(&g_big_cores, "frame thread"); }
+
+void plat_pin_prime_core(void) { pin_cores(&g_prime_cores, "translation thread"); }
+
 void plat_reset_affinity(void) {
     pthread_once(&g_big_once, big_cores_init);
-    if (g_big_ready == 1) sched_setaffinity(0, sizeof g_all_cores, &g_all_cores);
-    if (uclamp_min_value()) set_uclamp_min(0);
+    if (g_big_ready == 1) {
+        const char *t = getenv("LARECOMP_BIG_THREADS");
+        const cpu_set_t *set = (t && !strcmp(t, "frame")) ? &g_all_cores : &g_fast_cores;
+        sched_setaffinity(0, sizeof *set, set);
+    }
+    if (uclamp_min_value()) set_uclamp_min(0);  // (the floor stays on the frame threads: plat_pin_big_cores)
 }
 
 void plat_disable_thp(void) {

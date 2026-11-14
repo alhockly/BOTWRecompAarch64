@@ -116,9 +116,11 @@ void plat_thread_unpin(void);
 #endif
 
 #if defined(__linux__) && !defined(__ANDROID__)
-// The window thread and the presenting thread on the cores faster than the slowest cluster (linux.c). A guest thread
-// starts back on the full set, so it does not inherit that mask. LARECOMP_BIG_CORES=0: off.
+// Guest threads start on every core faster than the slowest cluster (linux.c). The window thread stays on the
+// other big cores, and translation on the prime core when one core is a faster cluster. LARECOMP_BIG_THREADS=frame:
+// guests keep the full set. LARECOMP_BIG_CORES=0: off.
 void plat_pin_big_cores(void);
+void plat_pin_prime_core(void);
 void plat_reset_affinity(void);
 #endif
 

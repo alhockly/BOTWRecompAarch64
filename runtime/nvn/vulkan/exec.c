@@ -1156,6 +1156,10 @@ static pthread_cond_t jobs_cond = PTHREAD_COND_INITIALIZER;
 
 static void *worker(void *a) {
     (void)a;
+#if defined(__linux__) && !defined(__ANDROID__)
+    extern void plat_pin_big_cores(void);
+    plat_pin_big_cores();  // (started by the translation thread: not its prime core)
+#endif
     for (;;) {
         pthread_mutex_lock(&jobs_lock);
         while (!jobs_head) pthread_cond_wait(&jobs_cond, &jobs_lock);
@@ -1183,6 +1187,10 @@ static pthread_mutex_t tjobs_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t tjobs_cond = PTHREAD_COND_INITIALIZER;
 static void *translator(void *a) {
     (void)a;
+#if defined(__linux__) && !defined(__ANDROID__)
+    extern void plat_pin_big_cores(void);
+    plat_pin_big_cores();  // (started by the translation thread: not its prime core)
+#endif
     for (;;) {
         pthread_mutex_lock(&tjobs_lock);
         while (!tjobs_head) pthread_cond_wait(&tjobs_cond, &tjobs_lock);
